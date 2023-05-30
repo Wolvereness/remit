@@ -18,7 +18,7 @@ Add to dependencies:
 
 ```toml
 [dependencies]
-remit = "0.1.0"
+remit = "0.1.1"
 ```
 
 Example code:
@@ -52,6 +52,22 @@ assert_eq!(vec![1], Generator::boxed(|remit| async move { remit.value(1).await; 
 fn iter() -> impl Iterator<Item=usize> {
     Generator::boxed(gen)
 }
+
+async fn scream<D: std::fmt::Display>(iter: impl Iterator<Item=D>, remit: Remit<'_, String>) {
+    for person in iter {
+        remit.value(format!("{person} scream!")).await
+    }
+    remit.value("... for ice cream!".to_string());
+}
+let expected: Vec<String> = ["You scream!", "I scream!", "We all scream!", "... for ice cream!"].iter().map(ToString::to_string).collect();
+assert_eq!(
+    expected,
+    pin!(Generator::new()).parameterized(scream, ["You", "I", "We all"].iter()).collect::<Vec<String>>(),
+);
+assert_eq!(
+    expected,
+    Generator::boxed(|remit| scream(["You", "I", "We all"].iter(), remit)).collect::<Vec<String>>(),
+);
 ```
 
 ## License

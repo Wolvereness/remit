@@ -38,6 +38,28 @@
 //! }
 //! ```
 //!
+//! Parameterized usage.
+//! ```
+//! # use std::pin::pin;
+//! # use remit::{Generator, Remit};
+//! # use std::fmt;
+//! async fn scream<D: fmt::Display>(iter: impl Iterator<Item=D>, remit: Remit<'_, String>) {
+//!     for person in iter {
+//!         remit.value(format!("{person} scream!")).await
+//!     }
+//!     remit.value("... for ice cream!".to_string());
+//! }
+//! let expected: Vec<String> = ["You scream!", "I scream!", "We all scream!", "... for ice cream!"].iter().map(ToString::to_string).collect();
+//! assert_eq!(
+//!     expected,
+//!     pin!(Generator::new()).parameterized(scream, ["You", "I", "We all"].iter()).collect::<Vec<String>>(),
+//! );
+//! assert_eq!(
+//!     expected,
+//!     Generator::boxed(|remit| scream(["You", "I", "We all"].iter(), remit)).collect::<Vec<String>>(),
+//! );
+//! ```
+//!
 //! Usage of a generator that only functions for `'static`.
 //! ```
 //! use remit::{Generator, Remit};
@@ -85,7 +107,6 @@
 //!     // Even though the future is done, the values were already sent.
 //! }
 //! assert_eq!(vec![11, 13, 17, 19], pin!(Generator::new()).of(delay_await).collect::<Vec<_>>());
-//!
 //! ```
 //!
 //! Incorrect attempt of a stack-based generator.
@@ -139,14 +160,22 @@ mod context;
 /// Trait used for relaxing the lifetime requirements of the generator storage.
 ///
 /// Implemented automatically for generators that accept any lifetime.
-pub unsafe trait RemitWithLifetime<'a, T> {}
+pub unsafe trait RemitWithLifetime<'a, T, X> {}
 
 unsafe impl<
     'a,
     T,
     F: FnOnce(Remit<'a, T>) -> R,
     R: Future<Output=()> + 'a
-> RemitWithLifetime<'a, T> for F {}
+> RemitWithLifetime<'a, T, ()> for F {}
+
+unsafe impl<
+    'a,
+    T,
+    X,
+    F: FnOnce(X, Remit<'a, T>) -> R,
+    R: Future<Output=()> + 'a,
+> RemitWithLifetime<'a, T, (X,)> for F {}
 
 /// The storage used for iterators that poll a generator.
 pub struct Generator<T, P> {
@@ -180,9 +209,9 @@ impl<T, P> Generator<T, P> {
     ) -> GeneratorIterator<'s, T, P>
         where
             // insures fn is not implemented only for 'static
-            G: for<'a> RemitWithLifetime<'a, T>,
+            G: for<'a> RemitWithLifetime<'a, T, ()>,
             // insures P is properly defined, even if it actually has a lifetime
-            G: FnOnce(Remit<'static, T>) -> P
+            G: FnOnce(Remit<'static, T>) -> P,
     {
         let inner = unsafe { self.get_unchecked_mut() };
         let value = inner.values.get();
@@ -201,10 +230,41 @@ impl<T, P> Generator<T, P> {
         }
     }
 
+    /// The same as [`Generator::of()`] but allows passing a parameter in.
+    pub fn parameterized<'s, G, X>(
+        self: Pin<&'s mut Self>,
+        gen: G,
+        parameter: X,
+    ) -> GeneratorIterator<'s, T, P>
+        where
+            // insures fn is not implemented only for 'static
+            G: for<'a> RemitWithLifetime<'a, T, (X,)>,
+            // insures P is properly defined, even if it actually has a lifetime
+            G: FnOnce(X, Remit<'static, T>) -> P,
+    {
+        let inner = unsafe { self.get_unchecked_mut() };
+        let value = inner.values.get();
+        let mode = Mode::Pinned {
+            value,
+            // This becomes 'static, and the trait-guard is where the real protection is
+            _lifetime: PhantomData,
+        };
+        let future = gen(parameter, Remit(mode));
+        let future = inner.future.insert(future);
+        GeneratorIterator {
+            done: false,
+            mode,
+            future,
+            _owner: None,
+        }
+    }
+
     /// Uses an allocation so that the iterator does not need to be borrowed.
     /// Useful for returning an iterator from a function, where it can't be pinned to the stack.
     ///
     /// The generator only needs to be valid for `'static`; it does not need to be valid for all lifetimes.
+    ///
+    /// To pass in parameters, use a capturing closure.
     pub fn boxed(gen: impl FnOnce(Remit<'static, T>) -> P) -> GeneratorIterator<'static, T, P> {
         let rc = Rc::new(Cycler {
             future: Default::default(),
