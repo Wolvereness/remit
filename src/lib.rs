@@ -152,7 +152,11 @@ use std::{
         Rc,
         Weak,
     },
-    task::Poll,
+    task::{
+        Poll,
+        Context,
+        Waker,
+    },
 };
 
 mod context;
@@ -348,7 +352,9 @@ impl<T, P: Future<Output=()>> Iterator for GeneratorIterator<'_, T, P> {
         if self.done {
             return None
         }
-        if let Poll::Ready(()) = unsafe { Pin::new_unchecked(&mut *self.future) }.poll(&mut context::get()) {
+        // FIXME: https://github.com/rust-lang/rust/issues/102012
+        let waker = unsafe { Waker::from_raw(context::NOOP_WAKER) };
+        if let Poll::Ready(()) = unsafe { Pin::new_unchecked(&mut *self.future) }.poll(&mut Context::from_waker(&waker)) {
             self.done = true;
         }
         self.mode.next()
