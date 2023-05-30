@@ -2,3 +2,13 @@
 name = "remit"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/Wolvereness/remit/"
+authors = ["Wesley Wolfe"]
+license = "MIT OR Apache-2.0"
+description = "Rust generators implemented through async/await syntax"
+homepage = "https://github.com/Wolvereness/remit/"
+documentation = "https://docs.rs/remit"
+include = ["src/*", "Cargo.toml"]
+readme = "README.md"
+keywords = [ "generator", "yield" ]
+categories = [ "rust-patterns" ]
