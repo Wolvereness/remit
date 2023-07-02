@@ -145,7 +145,7 @@ use std::{
     pin::Pin,
     ptr::{
         addr_of,
-        drop_in_place,
+        read,
         null_mut,
     },
     rc::{
@@ -320,7 +320,7 @@ struct Cycler<P, T> {
 impl<P, T> Cycler<P, T> {
     unsafe fn do_inner_drop(ptr: *mut ()) {
         let ptr: *mut Weak<Cycler<P, T>> = ptr as _;
-        drop_in_place::<Weak<Cycler<P, T>>>(ptr)
+        let _: Weak<Cycler<P, T>> = read(ptr);
     }
 
     unsafe fn is_strong(ptr: *mut ()) -> bool {
