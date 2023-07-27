@@ -10,7 +10,12 @@ Rust generators implemented through async/await syntax.
 The pinned implementation is stack-based, and the boxed is heap-based.
 No fancy macros and a simple API. Values can be lazily or eagerly yielded.
 
-No dependencies outside of `std`.
+This crate is inherently no-std, and the default `alloc` feature can be disabled.
+
+Some behaviors exhibited by the *lack* of `alloc` are not part of the SemVer.
+For example, not awaiting before another remit, without alloc, is
+[unspecified](https://doc.rust-lang.org/reference/behavior-not-considered-unsafe.html)
+behavior.
 
 ## Usage
 
