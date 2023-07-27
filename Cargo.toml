@@ -1,6 +1,6 @@
 [package]
 name = "remit"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 repository = "https://github.com/Wolvereness/remit/"
 authors = ["Wesley Wolfe"]
@@ -12,3 +12,7 @@ include = ["src/*", "Cargo.toml"]
 readme = "README.md"
 keywords = [ "generator", "yield" ]
 categories = [ "rust-patterns" ]
+
+[features]
+default = ["alloc"]
+alloc = []

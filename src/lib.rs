@@ -3,6 +3,13 @@
 //! The pinned implementation is stack-based, and the boxed is heap-based.
 //! No fancy macros and a simple API. Values can be lazily or eagerly yielded.
 //!
+//! This crate is inherently no-std, and the default `alloc` feature can be disabled.
+//!
+//! Some behaviors exhibited by the *lack* of `alloc` are not part of the SemVer.
+//! For example, not awaiting before another remit, without alloc, is
+//! [unspecified](https://doc.rust-lang.org/reference/behavior-not-considered-unsafe.html)
+//! behavior.
+//!
 //! ## Examples
 //!
 //! General usage of unbounded generator.
@@ -31,8 +38,9 @@
 //!         .collect::<Vec<_>>(),
 //! );
 //! */
+//! # #[cfg(feature = "alloc")]
 //! assert_eq!(vec![42, 1], Generator::boxed(gen).take(2).collect::<Vec<_>>());
-//!
+//! # #[cfg(feature = "alloc")]
 //! fn iter() -> impl Iterator<Item=usize> {
 //!     Generator::boxed(gen)
 //! }
@@ -43,6 +51,7 @@
 //! # use std::pin::pin;
 //! # use remit::{Generator, Remit};
 //! # use std::fmt;
+//! # #[cfg(feature = "alloc")] {
 //! async fn scream<D: fmt::Display>(iter: impl Iterator<Item=D>, remit: Remit<'_, String>) {
 //!     for person in iter {
 //!         remit.value(format!("{person} scream!")).await
@@ -58,12 +67,13 @@
 //!     expected,
 //!     Generator::boxed(|remit| scream(["You", "I", "We all"].iter(), remit)).collect::<Vec<String>>(),
 //! );
+//! # }
 //! ```
 //!
 //! Usage of a generator that only functions for `'static`.
 //! ```
-//! use remit::{Generator, Remit};
-//!
+//! # use remit::{Generator, Remit};
+//! # #[cfg(feature = "alloc")] {
 //! async fn gen(remit: Remit<'static, usize>) {
 //!     remit.value(2).await;
 //!     remit.value(3).await;
@@ -79,6 +89,7 @@
 //! fn iter() -> impl Iterator<Item=usize> {
 //!     Generator::boxed(gen)
 //! }
+//! # }
 //! ```
 //!
 //! Unorthodox usage of "eagerly" yielding values.
@@ -86,14 +97,21 @@
 //! # use std::pin::pin;
 //! # use remit::{Generator, Remit};
 //! // These implementations run successfully.
-//! // However, they trigger creation of a buffer.
+//! // However, they trigger creation of a buffer with alloc.
 //! async fn no_await(remit: Remit<'_, usize>) {
 //!     let _discard_future = remit.value(2);
 //!     let _discard_future = remit.value(3);
 //!     let _discard_future = remit.value(5);
 //!     let _discard_future = remit.value(7);
 //! }
-//! assert_eq!(vec![2, 3, 5, 7], pin!(Generator::new()).of(no_await).collect::<Vec<_>>());
+//! assert_eq!(
+//!     if cfg!(feature = "alloc") {
+//!         vec![2, 3, 5, 7]
+//!     } else {
+//!         vec![7]
+//!     },
+//!     pin!(Generator::new()).of(no_await).collect::<Vec<_>>(),
+//! );
 //!
 //! async fn delay_await(remit: Remit<'_, usize>) {
 //!     let first_remit = remit.value(11);
@@ -106,7 +124,14 @@
 //!     let _ = remit.value(19);
 //!     // Even though the future is done, the values were already sent.
 //! }
-//! assert_eq!(vec![11, 13, 17, 19], pin!(Generator::new()).of(delay_await).collect::<Vec<_>>());
+//! assert_eq!(
+//!     if cfg!(feature = "alloc") {
+//!         vec![11, 13, 17, 19]
+//!     } else {
+//!         vec![13, 19]
+//!     },
+//!     pin!(Generator::new()).of(delay_await).collect::<Vec<_>>()
+//! );
 //! ```
 //!
 //! Incorrect attempt of a stack-based generator.
@@ -122,13 +147,15 @@
 //!     println!("{item}");
 //! }
 //! ```
+//!
+//! ## Features
+//!
+//! * **alloc** -
+//!   Enables the use of a boxed generator and multiple pending values.
+//!   Defaults to enabled.
 
-use std::{
-    cell::{
-        Cell,
-        UnsafeCell,
-    },
-    collections::VecDeque,
+use core::{
+    cell::UnsafeCell,
     future::{
         Future,
         poll_fn,
@@ -138,24 +165,35 @@ use std::{
         PhantomData,
         PhantomPinned,
     },
-    mem::{
-        self,
-        MaybeUninit,
-    },
+    mem,
     pin::Pin,
+    task::{
+        Poll,
+        Context,
+        Waker,
+    },
+};
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+#[cfg(feature = "alloc")]
+use core::{
+    cell::Cell,
+    mem::MaybeUninit,
     ptr::{
         addr_of,
         read,
         null_mut,
     },
+};
+
+#[cfg(feature = "alloc")]
+use alloc::{
+    collections::VecDeque,
     rc::{
         Rc,
         Weak,
-    },
-    task::{
-        Poll,
-        Context,
-        Waker,
     },
 };
 
@@ -164,6 +202,8 @@ mod context;
 /// Trait used for relaxing the lifetime requirements of the generator storage.
 ///
 /// Implemented automatically for generators that accept any lifetime.
+///
+/// Direct usage of this trait is not considered part of SemVer.
 pub unsafe trait RemitWithLifetime<'a, T, X> {}
 
 unsafe impl<
@@ -230,6 +270,7 @@ impl<T, P> Generator<T, P> {
             done: false,
             mode,
             future,
+            #[cfg(feature = "alloc")]
             _owner: None,
         }
     }
@@ -259,10 +300,12 @@ impl<T, P> Generator<T, P> {
             done: false,
             mode,
             future,
+            #[cfg(feature = "alloc")]
             _owner: None,
         }
     }
 
+    #[cfg(feature = "alloc")]
     /// Uses an allocation so that the iterator does not need to be borrowed.
     /// Useful for returning an iterator from a function, where it can't be pinned to the stack.
     ///
@@ -292,6 +335,7 @@ impl<T, P> Generator<T, P> {
     }
 }
 
+#[cfg(feature = "alloc")]
 struct References<T> {
     interchange: UnsafeCell<Values<T>>,
     dropper: unsafe fn(*mut ()),
@@ -299,6 +343,7 @@ struct References<T> {
     ptr: Cell<*mut ()>,
 }
 
+#[cfg(feature = "alloc")]
 impl<T> References<T> {
     fn new<P>() -> Self {
         References {
@@ -310,6 +355,7 @@ impl<T> References<T> {
     }
 }
 
+#[cfg(feature = "alloc")]
 struct Cycler<P, T> {
     future: UnsafeCell<Option<P>>,
     references: References<T>,
@@ -317,6 +363,7 @@ struct Cycler<P, T> {
     _pin: PhantomPinned,
 }
 
+#[cfg(feature = "alloc")]
 impl<P, T> Cycler<P, T> {
     unsafe fn do_inner_drop(ptr: *mut ()) {
         let ptr: *mut Weak<Cycler<P, T>> = ptr as _;
@@ -340,6 +387,7 @@ pub struct GeneratorIterator<'a, T, P> {
     done: bool,
     mode: Mode<'a, T>,
     future: &'a mut P,
+    #[cfg(feature = "alloc")]
     _owner: Option<Rc<Cycler<P, T>>>,
 }
 
@@ -373,6 +421,7 @@ impl<T, P: Future<Output=()>> Iterator for GeneratorIterator<'_, T, P> {
 enum Values<T> {
     Present(T),
     Missing,
+    #[cfg(feature = "alloc")]
     Multiple(VecDeque<T>),
 }
 
@@ -381,6 +430,7 @@ enum Mode<'a, T> {
         value: *mut Values<T>,
         _lifetime: PhantomData<&'a ()>,
     },
+    #[cfg(feature = "alloc")]
     Boxed(*const References<T>),
 }
 
@@ -404,6 +454,7 @@ impl<T> Mode<'_, T> {
                 value,
                 ..
             } => value,
+            #[cfg(feature = "alloc")]
             Mode::Boxed(ptr) => unsafe { &*addr_of!((*ptr).interchange) }.get()
         }
     }
@@ -421,15 +472,18 @@ impl<T> Mode<'_, T> {
                 if let Present(value) = mem::replace(values, Missing) {
                     Some(value)
                 } else { unsafe { unreachable_unchecked() } },
+            #[cfg(feature = "alloc")]
             Multiple(list) => list.pop_front(),
         }
     }
 
     #[inline(always)]
     fn push(&self, value: T) {
-        Self::push_inner(unsafe { &mut *self.values() }, value)
+        // Drop-call occurs after mutable reference is gone (for no-alloc).
+        let _ = Self::push_inner(unsafe { &mut *self.values() }, value);
     }
 
+    #[cfg(feature = "alloc")]
     fn push_inner(values: &mut Values<T>, value: T) {
         use Values::*;
         match values {
@@ -446,6 +500,11 @@ impl<T> Mode<'_, T> {
         }
     }
 
+    #[cfg(not(feature = "alloc"))]
+    fn push_inner(values: &mut Values<T>, value: T) -> Values<T> {
+        mem::replace(values, Values::Present(value))
+    }
+
     #[inline(always)]
     fn len(&self) -> usize {
         Self::len_inner(unsafe { &*self.values() })
@@ -456,6 +515,7 @@ impl<T> Mode<'_, T> {
         match values {
             Present(_) => 1,
             Missing => 0,
+            #[cfg(feature = "alloc")]
             Multiple(list) => list.len(),
         }
     }
@@ -470,6 +530,7 @@ impl<T> Mode<'_, T> {
         match values {
             Present(_) => false,
             Missing => true,
+            #[cfg(feature = "alloc")]
             Multiple(list) => list.is_empty(),
         }
     }
@@ -484,6 +545,9 @@ impl<T> Remit<'_, T> {
     ///
     /// If multiple calls are performed without awaiting for the iterator to consume them,
     /// an unbounded buffer will be allocated to store the extra values.
+    /// Only available with the `alloc` feature, otherwise behavior is SemVer
+    /// [unspecified](https://doc.rust-lang.org/reference/behavior-not-considered-unsafe.html),
+    /// but currently replaces the previous value.
     ///
     /// A caller *should* await the future, but does not need to.
     /// The provided future will only finish when all values have been accepted by the iterator.
@@ -493,7 +557,25 @@ impl<T> Remit<'_, T> {
     ///
     /// If the iterator has been dropped,
     /// values will be discarded and the future(s) will always poll as pending.
+    #[inline(always)]
     pub fn value(&self, value: T) -> impl Future<Output=()> + '_ {
+        self.value_impl(value)
+    }
+
+    #[cfg(not(feature = "alloc"))]
+    fn value_impl(&self, value: T) -> impl Future<Output=()> + '_ {
+        self.0.push(value);
+        poll_fn(|_ctx|
+            if self.0.is_empty() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        )
+    }
+
+    #[cfg(feature = "alloc")]
+    fn value_impl(&self, value: T) -> impl Future<Output=()> + '_ {
         if unsafe { self.strong() } {
             self.0.push(value);
         }
@@ -506,6 +588,7 @@ impl<T> Remit<'_, T> {
         )
     }
 
+    #[cfg(feature = "alloc")]
     unsafe fn strong(&self) -> bool {
         if let &Remit(Mode::Boxed(ptr)) = self {
             let inner_ptr = (*addr_of!((*ptr).ptr)).get();
@@ -515,6 +598,7 @@ impl<T> Remit<'_, T> {
         }
     }
 
+    #[cfg(feature = "alloc")]
     unsafe fn dropping(&mut self) {
         if let &mut Remit(Mode::Boxed(ptr)) = self {
             let inner_ptr = (*addr_of!((*ptr).ptr)).get();
@@ -523,6 +607,7 @@ impl<T> Remit<'_, T> {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl<T> Drop for Remit<'_, T> {
     fn drop(&mut self) {
         unsafe { self.dropping() }
