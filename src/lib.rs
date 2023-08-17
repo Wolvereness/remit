@@ -386,7 +386,7 @@ impl<P, T> Cycler<P, T> {
 pub struct GeneratorIterator<'a, T, P> {
     done: bool,
     mode: Mode<'a, T>,
-    future: &'a mut P,
+    future: *mut P,
     #[cfg(feature = "alloc")]
     _owner: Option<Rc<Cycler<P, T>>>,
 }
