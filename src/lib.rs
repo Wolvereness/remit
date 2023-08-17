@@ -134,6 +134,75 @@
 //! );
 //! ```
 //!
+//! Usage of a boxed generator that borrows the parameter.
+//! ```
+//! # use remit::*;
+//! # #[cfg(feature = "alloc")] {
+//! let data = String::from("hi");
+//!
+//! async fn gen_implicit(data: &str, remit: Remit<'static, usize>) {
+//!     remit.value(data.len()).await;
+//!     remit.value(data.len()).await;
+//! }
+//!
+//! fn gen_explicit<'a>(data: &'a str, remit: Remit<'static, usize>) -> impl std::future::Future<Output=()> + 'a {
+//!     async move {
+//!         remit.value(data.len()).await;
+//!         remit.value(data.len()).await;
+//!     }
+//! }
+//!
+//! fn iter_explicit<'a>(data: &'a str) -> GeneratorIterator<'static, usize, impl std::future::Future<Output=()> + 'a> {
+//!     Generator::boxed(|remit| gen_explicit(data, remit))
+//! }
+//!
+//! fn iter_implicit(data: &str) -> GeneratorIterator<'static, usize, impl std::future::Future<Output=()> + '_> {
+//!     Generator::boxed(|remit| gen_implicit(data, remit))
+//! }
+//!
+//! for item in iter_explicit(&data) {
+//!     dbg!(item);
+//! }
+//! for item in iter_implicit(&data) {
+//!     dbg!(item);
+//! }
+//! for item in Generator::boxed(|remit| gen_explicit(&data, remit)) {
+//!     dbg!(item);
+//! }
+//! for item in Generator::boxed(|remit| gen_implicit(&data, remit)) {
+//!     dbg!(item);
+//! }
+//! # }
+//! ```
+//!
+//! Usage of a stack-based parameterized generator that borrows the parameter.
+//! ```
+//! # use std::pin::pin;
+//! # use remit::*;
+//! let data = String::from("hi");
+//!
+//! async fn gen_implicit(data: &str, remit: Remit<'_, usize>) {
+//!     remit.value(data.len()).await;
+//!     remit.value(data.len()).await;
+//! }
+//! for item in pin!(Generator::new()).parameterized(gen_implicit, &data) {
+//!     dbg!(item);
+//! }
+//!
+//! /// Does not work, as explicit lifetime definitions fail HRTB.
+//! fn gen_explicit<'a: 'c, 'b: 'c, 'c>(data: &'a str, remit: Remit<'b, usize>) -> impl std::future::Future<Output=()> + 'c {
+//!     async move {
+//!         remit.value(data.len()).await;
+//!         remit.value(data.len()).await;
+//!     }
+//! }
+//! /* // See note above and https://github.com/rust-lang/rust/issues/114947
+//! for item in pin!(Generator::new()).parameterized(gen_explicit, &data) {
+//!     dbg!(item);
+//! }
+//! */
+//! ```
+//!
 //! Incorrect attempt of a stack-based generator.
 //! ```compile_fail
 //! # use std::pin::pin;
@@ -199,27 +268,35 @@ use alloc::{
 
 mod context;
 
+/// Erases the return-type so that other parameters don't get polluted by the HRTB.
+trait AsyncFnOnce<Arg> {}
+
+impl<F, A, R: Future> AsyncFnOnce<(A, )> for F
+    where
+        F: FnOnce(A) -> R,
+{}
+
+impl<F, A, B, R: Future> AsyncFnOnce<(A, B, )> for F
+    where
+        F: FnOnce(A, B) -> R,
+{}
+
 /// Trait used for relaxing the lifetime requirements of the generator storage.
 ///
 /// Implemented automatically for generators that accept any lifetime.
 ///
 /// Direct usage of this trait is not considered part of SemVer.
-pub unsafe trait RemitWithLifetime<'a, T, X> {}
+pub unsafe trait RemitWithLifetime<T, X> {}
 
-unsafe impl<
-    'a,
-    T,
-    F: FnOnce(Remit<'a, T>) -> R,
-    R: Future<Output=()> + 'a
-> RemitWithLifetime<'a, T, ()> for F {}
+unsafe impl<T, F> RemitWithLifetime<T, ()> for F
+    where
+        F: for<'a> AsyncFnOnce<(Remit<'a, T>, )>,
+{}
 
-unsafe impl<
-    'a,
-    T,
-    X,
-    F: FnOnce(X, Remit<'a, T>) -> R,
-    R: Future<Output=()> + 'a,
-> RemitWithLifetime<'a, T, (X,)> for F {}
+unsafe impl<T, X, F> RemitWithLifetime<T, (X, )> for F
+    where
+        F: for<'a> AsyncFnOnce<(X, Remit<'a, T>, )>,
+{}
 
 /// The storage used for iterators that poll a generator.
 pub struct Generator<T, P> {
@@ -238,6 +315,7 @@ impl<T, P> Generator<T, P> {
         }
     }
 
+    #[allow(clippy::needless_lifetimes)]
     /// Takes the pinned storage and the generator and provides an iterator.
     /// Stack based (does not use an allocation).
     ///
@@ -253,7 +331,7 @@ impl<T, P> Generator<T, P> {
     ) -> GeneratorIterator<'s, T, P>
         where
             // insures fn is not implemented only for 'static
-            G: for<'a> RemitWithLifetime<'a, T, ()>,
+            G: RemitWithLifetime<T, ()>,
             // insures P is properly defined, even if it actually has a lifetime
             G: FnOnce(Remit<'static, T>) -> P,
     {
@@ -275,6 +353,7 @@ impl<T, P> Generator<T, P> {
         }
     }
 
+    #[allow(clippy::needless_lifetimes)]
     /// The same as [`Generator::of()`] but allows passing a parameter in.
     pub fn parameterized<'s, G, X>(
         self: Pin<&'s mut Self>,
@@ -283,7 +362,7 @@ impl<T, P> Generator<T, P> {
     ) -> GeneratorIterator<'s, T, P>
         where
             // insures fn is not implemented only for 'static
-            G: for<'a> RemitWithLifetime<'a, T, (X,)>,
+            G: RemitWithLifetime<T, (X,)>,
             // insures P is properly defined, even if it actually has a lifetime
             G: FnOnce(X, Remit<'static, T>) -> P,
     {
