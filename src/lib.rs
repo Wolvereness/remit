@@ -335,6 +335,8 @@ impl<T, P> Generator<T, P> {
             // insures P is properly defined, even if it actually has a lifetime
             G: FnOnce(Remit<'static, T>) -> P,
     {
+        // SOUND: Pin passthrough; only `future` is inner-pinned.
+        // `future` only ever gets replaced via Option::insert
         let inner = unsafe { self.get_unchecked_mut() };
         let value = inner.values.get();
         let mode = Mode::Pinned {
@@ -366,6 +368,8 @@ impl<T, P> Generator<T, P> {
             // insures P is properly defined, even if it actually has a lifetime
             G: FnOnce(X, Remit<'static, T>) -> P,
     {
+        // SOUND: Pin passthrough; only `future` is inner-pinned.
+        // `future` only ever gets replaced via Option::insert
         let inner = unsafe { self.get_unchecked_mut() };
         let value = inner.values.get();
         let mode = Mode::Pinned {
@@ -399,10 +403,20 @@ impl<T, P> Generator<T, P> {
             _pin: Default::default(),
         });
         let weak = Rc::downgrade(&rc);
-        let ptr: *mut Weak<Cycler<P, T>> = unsafe { &mut *rc.weak_inner.get() }.write(weak);
-        rc.references.ptr.set(ptr as _);
+        // SOUND: Writing to an UnsafeCell.
+        // Only spot where it's being written, having been freshly created.
+        //
+        // NEED: unsafe-cell lets shared-references to not conflict with exclusive-reference to weak_inner
+        let ptr = unsafe { &mut *rc.weak_inner.get() }.write(weak);
+        // SOUND: no re-use of ptr
+        // SOUND: !Send !Sync respected, via `*mut P` in GeneratorIterator.
+        rc.references.ptr.set(unsafe { Cycler::<P, T>::ptr_convert(ptr) });
 
         let mode = Mode::Boxed(&rc.references);
+        // SOUND: Writing to an UnsafeCell.
+        // Only spot where it's being written, having been freshly created.
+        //
+        // NEED: unsafe-cell lets shared-references to not conflict with exclusive-reference to future
         let future = unsafe { &mut *rc.future.get() }.insert(gen(Remit(mode)));
 
         GeneratorIterator {
@@ -429,6 +443,7 @@ impl<T> References<T> {
             interchange: UnsafeCell::new(Values::Missing),
             dropper: Cycler::<P, T>::do_inner_drop,
             checker: Cycler::<P, T>::is_strong,
+            // Note that `null_mut` is only until the surrounding Rc gets created.
             ptr: Cell::new(null_mut()),
         }
     }
@@ -444,13 +459,33 @@ struct Cycler<P, T> {
 
 #[cfg(feature = "alloc")]
 impl<P, T> Cycler<P, T> {
+    #[inline(always)]
+    /// Exclusive-ref must not reused.
+    /// Resulting ptr must be kept !Send !Sync
+    // NEED: erasing Cycler's storage generic, which ends up recursive
+    unsafe fn ptr_convert(ptr: &mut Weak<Cycler<P, T>>) -> *mut () {
+        ptr as _
+    }
+
+    /// ptr must be created with this Cycler's ptr_convert.
+    /// May only be called once.
+    // NEED: erasing Cycler's storage generic, which ends up recursive
     unsafe fn do_inner_drop(ptr: *mut ()) {
         let ptr: *mut Weak<Cycler<P, T>> = ptr as _;
+        // SOUND: (Rc-race-condition) ptr_convert requires !Send !Sync
+        // SOUND: (valid-ptr) ptr_convert instantiation
+        // SOUND: (double-drop) can only be called once
         let _: Weak<Cycler<P, T>> = read(ptr);
     }
 
+    /// ptr must be created with this Cycler's ptr_convert.
+    /// Must not be called after do_inner_drop.
+    // NEED: erasing Cycler's storage generic, which ends up recursive
     unsafe fn is_strong(ptr: *mut ()) -> bool {
         let ptr: *const Weak<Cycler<P, T>> = ptr as _;
+        // SOUND: (use-after-free) can't be called after do_inner_drop
+        // SOUND: (valid-ptr) ptr_convert instantiation
+        // SOUND: (no exclusive ref violation) only exclusive-ref is do_inner_drop
         (*ptr).strong_count() > 0
     }
 }
@@ -480,7 +515,21 @@ impl<T, P: Future<Output=()>> Iterator for GeneratorIterator<'_, T, P> {
             return None
         }
         // FIXME: https://github.com/rust-lang/rust/issues/102012
+        // SOUND: We can't use Arc without alloc,
+        // so context just defines some no-operation functions to fill out a v-table.
         let waker = unsafe { Waker::from_raw(context::NOOP_WAKER) };
+        // SOUND: (pinning) Sound, we created the ptr to future ourselves and it was pinned,
+        // either via Rc or via a pinned-self.
+        //
+        // SOUND: (&mut exclusive) The ptr never gets touched other than here,
+        // or after the lifetime expires and Generator is re-borrowed.
+        // Note that this is through an exclusive-borrow of self.
+        // Original exclusive-reference was also used for creation without leaking.
+        //
+        // SOUND: (use-after-free) The ptr's lifetime is reflected in GeneratorIterator,
+        // either owned in _owner, or pinned-self.
+        //
+        // SOUND: (valid-ptr) Not-pub, and is always valid at instantiation.
         if let Poll::Ready(()) = unsafe { Pin::new_unchecked(&mut *self.future) }.poll(&mut Context::from_waker(&waker)) {
             self.done = true;
         }
@@ -534,12 +583,34 @@ impl<T> Mode<'_, T> {
                 ..
             } => value,
             #[cfg(feature = "alloc")]
+            // SOUND: (valid-ptr) Not-pub, and is always valid at instantiation.
+            //
+            // SOUND: (use-after-free) Not public type. Encapsulating type owns it.
+            //
+            // SOUND: (no exclusive ref violation)
+            // * `*const ptr` never borrowed exclusively
+            // * ptr never leaked
+            //
+            // NEED: erasing Cycler's storage generic, which ends up recursive
             Mode::Boxed(ptr) => unsafe { &*addr_of!((*ptr).interchange) }.get()
         }
     }
 
     #[inline(always)]
     fn next(&self) -> Option<T> {
+        // SOUND: (valid-ptr) Not-pub, and is always valid at instantiation.
+        //
+        // SOUND: (use-after-free) Not public type.
+        // Either encapsulating type owns it, or reflected in lifetime.
+        //
+        // SOUND: (&mut exclusive)
+        // * only accessed in this impl
+        // * non-recursively (note: no calls to drop)
+        // * behind UnsafeCell
+        // * !Send, !Sync
+        //
+        // NEED: lock-free exchange
+        // NEED: pinned-variant's lifetime cheat
         Self::next_inner(unsafe { &mut *self.values() })
     }
 
@@ -550,7 +621,10 @@ impl<T> Mode<'_, T> {
             Present(_) =>
                 if let Present(value) = mem::replace(values, Missing) {
                     Some(value)
-                } else { unsafe { unreachable_unchecked() } },
+                } else {
+                    // SOUND: note exclusive-reference and surrounding match
+                    unsafe { unreachable_unchecked() }
+                },
             #[cfg(feature = "alloc")]
             Multiple(list) => list.pop_front(),
         }
@@ -558,7 +632,19 @@ impl<T> Mode<'_, T> {
 
     #[inline(always)]
     fn push(&self, value: T) {
-        // Drop-call occurs after mutable reference is gone (for no-alloc).
+        // SOUND: (valid-ptr) Not-pub, and is always valid at instantiation.
+        //
+        // SOUND: (use-after-free) Not public type.
+        // Either encapsulating type owns it, or reflected in lifetime.
+        //
+        // SOUND: (&mut exclusive)
+        // * only accessed in this impl
+        // * non-recursively (note: drop is after exclusive-reference is gone for no-alloc)
+        // * behind UnsafeCell
+        // * !Send, !Sync
+        //
+        // NEED: lock-free exchange
+        // NEED: pinned-variant's lifetime cheat
         let _ = Self::push_inner(unsafe { &mut *self.values() }, value);
     }
 
@@ -569,7 +655,10 @@ impl<T> Mode<'_, T> {
             Missing => *values = Present(value),
             Present(_) => {
                 let Present(old) = mem::replace(values, Missing)
-                    else { unsafe { unreachable_unchecked() } };
+                    else {
+                        // SOUND: note exclusive-reference and surrounding match
+                        unsafe { unreachable_unchecked() }
+                    };
                 let mut list = VecDeque::with_capacity(2);
                 list.push_back(old);
                 list.push_back(value);
@@ -586,6 +675,18 @@ impl<T> Mode<'_, T> {
 
     #[inline(always)]
     fn len(&self) -> usize {
+        // SOUND: (null-ptr) Not-pub, and is always valid at instantiation.
+        //
+        // SOUND: (use-after-free) Not public type.
+        // Either encapsulating type owns it, or reflected in lifetime.
+        //
+        // SOUND: (no exclusive ref violation)
+        // * only accessed in this impl
+        // * non-recursively (note: no calls to drop)
+        // * !Send, !Sync
+        //
+        // NEED: lock-free exchange
+        // NEED: pinned-variant's lifetime cheat
         Self::len_inner(unsafe { &*self.values() })
     }
 
@@ -601,6 +702,18 @@ impl<T> Mode<'_, T> {
 
     #[inline(always)]
     fn is_empty(&self) -> bool {
+        // SOUND: (valid-ptr) Not-pub, and is always valid at instantiation.
+        //
+        // SOUND: (use-after-free) Not public type.
+        // Either encapsulating type owns it, or reflected in lifetime.
+        //
+        // SOUND: (no exclusive ref violation)
+        // * only accessed in this impl
+        // * non-recursively (note: no calls to drop)
+        // * !Send, !Sync
+        //
+        // NEED: lock-free exchange
+        // NEED: pinned-variant's lifetime cheat
         Self::is_empty_inner(unsafe { &*self.values() })
     }
 
@@ -655,10 +768,18 @@ impl<T> Remit<'_, T> {
 
     #[cfg(feature = "alloc")]
     fn value_impl(&self, value: T) -> impl Future<Output=()> + '_ {
+        // SOUND: non-public field, valid at instantiation
+        // SOUND: self not dropped
+        //
+        // NEED: use-after-free prevention of value-exchange
         if unsafe { self.strong() } {
             self.0.push(value);
         }
         poll_fn(|_ctx|
+            // SOUND: non-public field, valid at instantiation
+            // SOUND: self not dropped
+            //
+            // NEED: use-after-free prevention of value-exchange
             if unsafe { self.strong() } && self.0.is_empty() {
                 Poll::Ready(())
             } else {
@@ -668,9 +789,23 @@ impl<T> Remit<'_, T> {
     }
 
     #[cfg(feature = "alloc")]
+    /// Requires the box-ptr to be instantiated correctly.
+    /// May not be called after dropping.
+    // SOUND: (use-after-free) cannot be called after dropping()
+    //
+    // SOUND: (no exclusive ref violation)
+    // * `*const ptr`s never borrowed exclusively
+    // * ptrs never leaked
+    //
+    // NEED: erasing Cycler's storage generic, which ends up recursive
+    // NEED: use-after-free prevention of value-exchange
     unsafe fn strong(&self) -> bool {
         if let &Remit(Mode::Boxed(ptr)) = self {
             let inner_ptr = (*addr_of!((*ptr).ptr)).get();
+            // SOUND: checker is not pub, nor was inner_ptr,
+            // thus still valid from instantiation
+            //
+            // SOUND: unsafe-fn, see Cycler::is_strong
             (*addr_of!((*ptr).checker))(inner_ptr)
         } else {
             true
@@ -678,9 +813,27 @@ impl<T> Remit<'_, T> {
     }
 
     #[cfg(feature = "alloc")]
+    /// Requires the box-ptr to be instantiated correctly,
+    /// and may only be called once.
+
+    // SOUND: (use-after-free) free occurs here, and not read after
+    //
+    // SOUND: (no exclusive ref violation)
+    // * `*const ptr`s never borrowed exclusively
+    // * ptrs never leaked
+    //
+    // NEED: erasing Cycler's storage generic, which ends up recursive
     unsafe fn dropping(&mut self) {
         if let &mut Remit(Mode::Boxed(ptr)) = self {
             let inner_ptr = (*addr_of!((*ptr).ptr)).get();
+            // SOUND: dropper is not pub, nor was inner_ptr,
+            // thus still valid from instantiation
+            //
+            // SOUND: dropper only called once for inner_ptr,
+            // as inner_ptr only exists in this struct,
+            // and dropping is only called once.
+            //
+            // SOUND: unsafe-fn, see Cycler::do_inner_drop
             (*addr_of!((*ptr).dropper))(inner_ptr)
         }
     }
@@ -689,6 +842,8 @@ impl<T> Remit<'_, T> {
 #[cfg(feature = "alloc")]
 impl<T> Drop for Remit<'_, T> {
     fn drop(&mut self) {
+        // SOUND: Valid at instantiation
+        // SOUND: Only call-site of dropping, and inner ptrs
         unsafe { self.dropping() }
     }
 }
