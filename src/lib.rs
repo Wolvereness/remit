@@ -15,7 +15,7 @@
 //! General usage of unbounded generator.
 //! ```
 //! use std::pin::pin;
-//! use remit::{Generator, Remit};
+//! use remit::{Generators, Remit};
 //!
 //! async fn gen(remit: Remit<'_, usize>) {
 //!     remit.value(42).await;
@@ -24,55 +24,55 @@
 //!         remit.value(i).await
 //!     }
 //! }
-//! for item in pin!(Generator::new()).of(gen).take(10) {
+//! for item in pin!(Generators::new()).of(gen).take(10) {
 //!     println!("{item}");
 //!     // Prints 42, 1, 2, 3, 4, 5, 6, 7, 8, 9
 //! }
-//! assert_eq!(vec![42, 1, 2, 3], pin!(Generator::new()).of(gen).take(4).collect::<Vec<_>>());
+//! assert_eq!(vec![42, 1, 2, 3], pin!(Generators::new()).of(gen).take(4).collect::<Vec<_>>());
 //! /*
 //! // Rust has trouble determining the lifetime
 //! assert_eq!(
 //!     vec![1],
-//!     pin!(Generator::new())
+//!     pin!(Generators::new())
 //!         .of(|remit: Remit<'_, usize>| async move { remit.value(1).await; })
 //!         .collect::<Vec<_>>(),
 //! );
 //! */
 //! # #[cfg(feature = "alloc")]
-//! assert_eq!(vec![42, 1], Generator::boxed(gen).take(2).collect::<Vec<_>>());
+//! assert_eq!(vec![42, 1], Generators::boxed(gen).take(2).collect::<Vec<_>>());
 //! # #[cfg(feature = "alloc")]
 //! fn iter() -> impl Iterator<Item=usize> {
-//!     Generator::boxed(gen)
+//!     Generators::boxed(gen)
 //! }
 //! ```
 //!
 //! Parameterized usage.
 //! ```
 //! # use std::pin::pin;
-//! # use remit::{Generator, Remit};
+//! # use remit::{Generators, Remit};
 //! # use std::fmt;
 //! # #[cfg(feature = "alloc")] {
 //! async fn scream<D: fmt::Display>(iter: impl Iterator<Item=D>, remit: Remit<'_, String>) {
 //!     for person in iter {
 //!         remit.value(format!("{person} scream!")).await
 //!     }
-//!     remit.value("... for ice cream!".to_string());
+//!     remit.value("... for ice cream!".to_string()).await;
 //! }
 //! let expected: Vec<String> = ["You scream!", "I scream!", "We all scream!", "... for ice cream!"].iter().map(ToString::to_string).collect();
 //! assert_eq!(
 //!     expected,
-//!     pin!(Generator::new()).parameterized(scream, ["You", "I", "We all"].iter()).collect::<Vec<String>>(),
+//!     pin!(Generators::new()).parameterized(scream, ["You", "I", "We all"].iter()).collect::<Vec<String>>(),
 //! );
 //! assert_eq!(
 //!     expected,
-//!     Generator::boxed(|remit| scream(["You", "I", "We all"].iter(), remit)).collect::<Vec<String>>(),
+//!     Generators::boxed(|remit| scream(["You", "I", "We all"].iter(), remit)).collect::<Vec<String>>(),
 //! );
 //! # }
 //! ```
 //!
 //! Usage of a generator that only functions for `'static`.
 //! ```
-//! # use remit::{Generator, Remit};
+//! # use remit::{Generators, Remit};
 //! # #[cfg(feature = "alloc")] {
 //! async fn gen(remit: Remit<'static, usize>) {
 //!     remit.value(2).await;
@@ -80,57 +80,93 @@
 //!     remit.value(5).await;
 //!     remit.value(7).await;
 //! }
-//! for item in Generator::boxed(gen) {
+//! for item in Generators::boxed(gen) {
 //!     println!("{item}");
 //! }
-//! assert_eq!(vec![2, 3, 5, 7], Generator::boxed(gen).collect::<Vec<_>>());
-//! assert_eq!(vec![1], Generator::boxed(|remit| async move { remit.value(1).await; }).collect::<Vec<_>>());
+//! assert_eq!(vec![2, 3, 5, 7], Generators::boxed(gen).collect::<Vec<_>>());
+//! assert_eq!(
+//!     vec![1],
+//!     Generators::boxed(|remit| async move {
+//!         // Note that `let () =` helps determine what the RemitBack type is.
+//!         // That is, it doesn't detect default `()` for non-exchangers.
+//!         let () = remit.value(1).await;
+//!     }).collect::<Vec<_>>(),
+//! );
 //!
 //! fn iter() -> impl Iterator<Item=usize> {
-//!     Generator::boxed(gen)
+//!     Generators::boxed(gen)
 //! }
 //! # }
 //! ```
 //!
-//! Unorthodox usage of "eagerly" yielding values.
+//! Unorthodox usage of yielding values.
 //! ```
+//! # use std::future::{Future, poll_fn};
 //! # use std::pin::pin;
-//! # use remit::{Generator, Remit};
+//! # use std::task::Poll;
+//! # use remit::{Generators, Remit};
 //! // These implementations run successfully.
 //! // However, they trigger creation of a buffer with alloc.
 //! async fn no_await(remit: Remit<'_, usize>) {
-//!     let _discard_future = remit.value(2);
-//!     let _discard_future = remit.value(3);
-//!     let _discard_future = remit.value(5);
-//!     let _discard_future = remit.value(7);
+//!     let mut a = pin!(remit.value(2));
+//!     let mut a_done = false;
+//!     let _ = remit.value(3);
+//!     let mut b = pin!(remit.value(5));
+//!     let mut b_done = false;
+//!     let _ = remit.value(7).await;
+//!     let mut c = pin!(remit.value(11));
+//!     let mut c_done = false;
+//!     let mut d = pin!(remit.value(13));
+//!     poll_fn(|ctx| {
+//!         // Note proper usage of not polling again after ready.
+//!         if !a_done {
+//!             if let Poll::Ready(()) = a.as_mut().poll(ctx) {
+//!                 a_done = true;
+//!             }
+//!         }
+//!         if !b_done {
+//!             if let Poll::Ready(()) = b.as_mut().poll(ctx) {
+//!                 b_done = true;
+//!             }
+//!         }
+//!         if !c_done {
+//!             if let Poll::Ready(()) = c.as_mut().poll(ctx) {
+//!                 c_done = true;
+//!             }
+//!         }
+//!         d.as_mut().poll(ctx)
+//!     }).await;
+//!     remit.value(17).await;
+//!     if !a_done {
+//!         a.await;
+//!     }
+//!     // Notice that this value never gets yielded without alloc!
+//!     // `a` was polled early, but the other polls pushed it out.
+//!     // Because the backing was pushed out, `a` was never ready.
+//!     remit.value(42).await;
 //! }
 //! assert_eq!(
 //!     if cfg!(feature = "alloc") {
-//!         vec![2, 3, 5, 7]
+//!         vec![7, 2, 5, 11, 13, 17, 42]
 //!     } else {
-//!         vec![7]
+//!         vec![7, 13, 17]
 //!     },
-//!     pin!(Generator::new()).of(no_await).collect::<Vec<_>>(),
+//!     pin!(Generators::new()).of(no_await).collect::<Vec<_>>(),
 //! );
 //!
 //! async fn delay_await(remit: Remit<'_, usize>) {
 //!     let first_remit = remit.value(11);
 //!     remit.value(13).await;
-//!     // Will poll-ready as the latter call implies all values are consumed.
-//!     // A join will also do the same.
+//!     // Sends the value
 //!     first_remit.await;
 //!
 //!     let _ = remit.value(17);
 //!     let _ = remit.value(19);
-//!     // Even though the future is done, the values were already sent.
+//!     // Values were not polled/awaited, and were not sent.
 //! }
 //! assert_eq!(
-//!     if cfg!(feature = "alloc") {
-//!         vec![11, 13, 17, 19]
-//!     } else {
-//!         vec![13, 19]
-//!     },
-//!     pin!(Generator::new()).of(delay_await).collect::<Vec<_>>()
+//!     vec![13, 11],
+//!     pin!(Generators::new()).of(delay_await).collect::<Vec<_>>()
 //! );
 //! ```
 //!
@@ -152,12 +188,12 @@
 //!     }
 //! }
 //!
-//! fn iter_explicit<'a>(data: &'a str) -> GeneratorIterator<'static, usize, impl std::future::Future<Output=()> + 'a> {
-//!     Generator::boxed(|remit| gen_explicit(data, remit))
+//! fn iter_explicit<'a>(data: &'a str) -> GeneratorIterator<'static, usize, impl std::future::Future<Output=()> + 'a, impl Fn() -> () + 'a> {
+//!     Generators::boxed(|remit| gen_explicit(data, remit))
 //! }
 //!
-//! fn iter_implicit(data: &str) -> GeneratorIterator<'static, usize, impl std::future::Future<Output=()> + '_> {
-//!     Generator::boxed(|remit| gen_implicit(data, remit))
+//! fn iter_implicit(data: &str) -> GeneratorIterator<'static, usize, impl std::future::Future<Output=()> + '_, impl Fn() -> () + '_> {
+//!     Generators::boxed(|remit| gen_implicit(data, remit))
 //! }
 //!
 //! for item in iter_explicit(&data) {
@@ -166,10 +202,10 @@
 //! for item in iter_implicit(&data) {
 //!     dbg!(item);
 //! }
-//! for item in Generator::boxed(|remit| gen_explicit(&data, remit)) {
+//! for item in Generators::boxed(|remit| gen_explicit(&data, remit)) {
 //!     dbg!(item);
 //! }
-//! for item in Generator::boxed(|remit| gen_implicit(&data, remit)) {
+//! for item in Generators::boxed(|remit| gen_implicit(&data, remit)) {
 //!     dbg!(item);
 //! }
 //! # }
@@ -185,7 +221,7 @@
 //!     remit.value(data.len()).await;
 //!     remit.value(data.len()).await;
 //! }
-//! for item in pin!(Generator::new()).parameterized(gen_implicit, &data) {
+//! for item in pin!(Generators::new()).parameterized(gen_implicit, &data) {
 //!     dbg!(item);
 //! }
 //!
@@ -197,7 +233,7 @@
 //!     }
 //! }
 //! /* // See note above and https://github.com/rust-lang/rust/issues/114947
-//! for item in pin!(Generator::new()).parameterized(gen_explicit, &data) {
+//! for item in pin!(Generators::new()).parameterized(gen_explicit, &data) {
 //!     dbg!(item);
 //! }
 //! */
@@ -206,13 +242,13 @@
 //! Incorrect attempt of a stack-based generator.
 //! ```compile_fail
 //! # use std::pin::pin;
-//! # use remit::{Generator, Remit};
+//! # use remit::{Generators, Remit};
 //! /// Only accepts `'static`, so it needs to be boxed.
 //! async fn gen(remit: Remit<'static, usize>) {
 //!     remit.value(1).await;
 //! }
 //! // Fails to compile, because gen is only `'static` and pinning is for the stack.
-//! for item in pin!(Generator::new()).of(gen) {
+//! for item in pin!(Generators::new()).of(gen) {
 //!     println!("{item}");
 //! }
 //! ```
@@ -245,9 +281,7 @@ use core::{
     },
     ptr::{
         eq,
-        read,
         write,
-        addr_of,
     }
 };
 
@@ -258,7 +292,11 @@ extern crate alloc;
 use core::{
     cell::Cell,
     mem::MaybeUninit,
-    ptr::null_mut,
+    ptr::{
+        null_mut,
+        read,
+        addr_of,
+    },
 };
 
 #[cfg(feature = "alloc")]
@@ -320,23 +358,14 @@ impl<T, P, O> Generators<T, P, O> {
     }
 
     #[allow(clippy::needless_lifetimes)]
-    /// Takes the pinned storage and the generator and provides an iterator.
-    /// Stack based (does not use an allocation).
-    ///
-    /// The internal storage assumes the generator was valid for a provided `'static`,
-    /// but requires the generator to be valid for all provided lifetimes.
-    /// That is, the `Remit` provided to the generator cannot be moved out,
-    /// even if at first glance it appears the storage does not have that restriction.
-    /// In effect, this relaxes the lifetime requirements of the storage,
-    /// but not the provided generator.
-    pub fn of<'s, G>(
+    pub fn pinned_exchange<'s, G>(
         self: Pin<&'s mut Self>,
         gen: G,
     ) -> Generator<'s, T, P, O>
         where
-            // insures fn is not implemented only for 'static
+        // insures fn is not implemented only for 'static
             G: RemitWithLifetime<T, O, ()>,
-            // insures P is properly defined, even if it actually has a lifetime
+        // insures P is properly defined, even if it actually has a lifetime
             G: FnOnce(Remit<'static, T, O>) -> P,
     {
         // SOUND: Pin passthrough; only `future` is inner-pinned.
@@ -360,16 +389,15 @@ impl<T, P, O> Generators<T, P, O> {
     }
 
     #[allow(clippy::needless_lifetimes)]
-    /// The same as [`Generators::of()`] but allows passing a parameter in.
-    pub fn parameterized<'s, G, X>(
+    pub fn parameterized_exchange<'s, G, X>(
         self: Pin<&'s mut Self>,
         gen: G,
         parameter: X,
     ) -> Generator<'s, T, P, O>
         where
-            // insures fn is not implemented only for 'static
+        // insures fn is not implemented only for 'static
             G: RemitWithLifetime<T, O, (X,)>,
-            // insures P is properly defined, even if it actually has a lifetime
+        // insures P is properly defined, even if it actually has a lifetime
             G: FnOnce(X, Remit<'static, T, O>) -> P,
     {
         // SOUND: Pin passthrough; only `future` is inner-pinned.
@@ -393,13 +421,7 @@ impl<T, P, O> Generators<T, P, O> {
     }
 
     #[cfg(feature = "alloc")]
-    /// Uses an allocation so that the iterator does not need to be borrowed.
-    /// Useful for returning an iterator from a function, where it can't be pinned to the stack.
-    ///
-    /// The generator only needs to be valid for `'static`; it does not need to be valid for all lifetimes.
-    ///
-    /// To pass in parameters, use a capturing closure.
-    pub fn boxed(gen: impl FnOnce(Remit<'static, T, O>) -> P) -> Generator<'static, T, P, O> {
+    pub fn boxed_exchange(gen: impl FnOnce(Remit<'static, T, O>) -> P) -> Generator<'static, T, P, O> {
         let rc = Rc::new(Cycler {
             future: Default::default(),
             references: References::new::<P>(),
@@ -429,6 +451,58 @@ impl<T, P, O> Generators<T, P, O> {
             future,
             _owner: Some(rc),
         }
+    }
+}
+
+impl<T, P, O: Default> Generators<T, P, O> {
+    #[allow(clippy::needless_lifetimes)]
+    /// Takes the pinned storage and the generator and provides an iterator.
+    /// Stack based (does not use an allocation).
+    ///
+    /// The internal storage assumes the generator was valid for a provided `'static`,
+    /// but requires the generator to be valid for all provided lifetimes.
+    /// That is, the `Remit` provided to the generator cannot be moved out,
+    /// even if at first glance it appears the storage does not have that restriction.
+    /// In effect, this relaxes the lifetime requirements of the storage,
+    /// but not the provided generator.
+    pub fn of<'s, G>(
+        self: Pin<&'s mut Self>,
+        gen: G,
+    ) -> GeneratorIterator<'s, T, P, impl Fn() -> O, O>
+        where
+            // insures fn is not implemented only for 'static
+            G: RemitWithLifetime<T, O, ()>,
+            // insures P is properly defined, even if it actually has a lifetime
+            G: FnOnce(Remit<'static, T, O>) -> P,
+    {
+        self.pinned_exchange(gen).defaults()
+    }
+
+    #[allow(clippy::needless_lifetimes)]
+    /// The same as [`Generators::of()`] but allows passing a parameter in.
+    pub fn parameterized<'s, G, X>(
+        self: Pin<&'s mut Self>,
+        gen: G,
+        parameter: X,
+    ) -> GeneratorIterator<'s, T, P, impl Fn() -> O, O>
+        where
+        // insures fn is not implemented only for 'static
+            G: RemitWithLifetime<T, O, (X,)>,
+        // insures P is properly defined, even if it actually has a lifetime
+            G: FnOnce(X, Remit<'static, T, O>) -> P,
+    {
+        self.parameterized_exchange(gen, parameter).defaults()
+    }
+
+    #[cfg(feature = "alloc")]
+    /// Uses an allocation so that the iterator does not need to be borrowed.
+    /// Useful for returning an iterator from a function, where it can't be pinned to the stack.
+    ///
+    /// The generator only needs to be valid for `'static`; it does not need to be valid for all lifetimes.
+    ///
+    /// To pass in parameters, use a capturing closure.
+    pub fn boxed(gen: impl FnOnce(Remit<'static, T, O>) -> P) -> GeneratorIterator<'static, T, P, impl Fn() -> O, O> {
+        Self::boxed_exchange(gen).defaults()
     }
 }
 
@@ -532,7 +606,7 @@ pub struct Generator<'a, T, P, O = ()> {
 }
 
 impl<'a, T, P, O> Generator<'a, T, P, O> {
-    pub fn provider<F: FnMut() -> O>(self, provider: F) -> GeneratorIterator<'a, T, P, O, F> {
+    pub fn provider<F: FnMut() -> O>(self, provider: F) -> GeneratorIterator<'a, T, P, F, O> {
         GeneratorIterator {
             generator: self,
             provider,
@@ -541,7 +615,7 @@ impl<'a, T, P, O> Generator<'a, T, P, O> {
 }
 
 impl<'a, T, P, O: Default> Generator<'a, T, P, O> {
-    pub fn defaults(self) -> GeneratorIterator<'a, T, P, O, impl Fn() -> O> {
+    pub fn defaults(self) -> GeneratorIterator<'a, T, P, impl Fn() -> O, O> {
         GeneratorIterator {
             generator: self,
             provider: Default::default,
@@ -549,7 +623,7 @@ impl<'a, T, P, O: Default> Generator<'a, T, P, O> {
     }
 }
 
-pub struct GeneratorIterator<'a, T, P, O, F> {
+pub struct GeneratorIterator<'a, T, P, F, O = ()> {
     generator: Generator<'a, T, P, O>,
     provider: F,
 }
@@ -616,7 +690,7 @@ impl<'s, T, P: Future<Output=()>, O: 's> Generator<'s, T, P, O> {
     }
 }
 
-impl<'s, T, P: Future<Output=()>, O: 's, F: FnMut() -> O> Iterator for GeneratorIterator<'s, T, P, O, F> {
+impl<'s, T, P: Future<Output=()>, O: 's, F: FnMut() -> O> Iterator for GeneratorIterator<'s, T, P, F, O> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -962,6 +1036,11 @@ impl<T, O> Mode<'_, T, O> {
         } else {
             true
         }
+    }
+
+    #[cfg(not(feature = "alloc"))]
+    const unsafe fn strong(&self) -> bool {
+        true
     }
 }
 
