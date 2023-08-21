@@ -227,20 +227,28 @@ use core::{
     cell::UnsafeCell,
     future::{
         Future,
-        poll_fn,
     },
     hint::unreachable_unchecked,
     marker::{
         PhantomData,
         PhantomPinned,
     },
-    mem,
+    mem::{
+        self,
+        ManuallyDrop,
+    },
     pin::Pin,
     task::{
         Poll,
         Context,
         Waker,
     },
+    ptr::{
+        eq,
+        read,
+        write,
+        addr_of,
+    }
 };
 
 #[cfg(feature = "alloc")]
@@ -250,11 +258,7 @@ extern crate alloc;
 use core::{
     cell::Cell,
     mem::MaybeUninit,
-    ptr::{
-        addr_of,
-        read,
-        null_mut,
-    },
+    ptr::null_mut,
 };
 
 #[cfg(feature = "alloc")]
@@ -286,29 +290,29 @@ impl<F, A, B, R: Future> AsyncFnOnce<(A, B, )> for F
 /// Implemented automatically for generators that accept any lifetime.
 ///
 /// Direct usage of this trait is not considered part of SemVer.
-pub unsafe trait RemitWithLifetime<T, X> {}
+pub unsafe trait RemitWithLifetime<T, O, X> {}
 
-unsafe impl<T, F> RemitWithLifetime<T, ()> for F
+unsafe impl<T, O, F> RemitWithLifetime<T, O, ()> for F
     where
-        F: for<'a> AsyncFnOnce<(Remit<'a, T>, )>,
+        F: for<'a> AsyncFnOnce<(Remit<'a, T, O>, )>,
 {}
 
-unsafe impl<T, X, F> RemitWithLifetime<T, (X, )> for F
+unsafe impl<T, O, X, F> RemitWithLifetime<T, O, (X, )> for F
     where
-        F: for<'a> AsyncFnOnce<(X, Remit<'a, T>, )>,
+        F: for<'a> AsyncFnOnce<(X, Remit<'a, T, O>, )>,
 {}
 
 /// The storage used for iterators that poll a generator.
-pub struct Generator<T, P> {
-    values: UnsafeCell<Values<T>>,
+pub struct Generators<T, P, O = ()> {
+    values: UnsafeCell<Values<T, O>>,
     future: Option<P>,
     _pin: PhantomPinned,
 }
 
-impl<T, P> Generator<T, P> {
+impl<T, P, O> Generators<T, P, O> {
     /// Provides the storage to be pinned when not using an allocation.
     pub fn new() -> Self {
-        Generator {
+        Generators {
             values: UnsafeCell::new(Values::Missing),
             future: None,
             _pin: PhantomPinned,
@@ -328,12 +332,12 @@ impl<T, P> Generator<T, P> {
     pub fn of<'s, G>(
         self: Pin<&'s mut Self>,
         gen: G,
-    ) -> GeneratorIterator<'s, T, P>
+    ) -> Generator<'s, T, P, O>
         where
             // insures fn is not implemented only for 'static
-            G: RemitWithLifetime<T, ()>,
+            G: RemitWithLifetime<T, O, ()>,
             // insures P is properly defined, even if it actually has a lifetime
-            G: FnOnce(Remit<'static, T>) -> P,
+            G: FnOnce(Remit<'static, T, O>) -> P,
     {
         // SOUND: Pin passthrough; only `future` is inner-pinned.
         // `future` only ever gets replaced via Option::insert
@@ -346,7 +350,7 @@ impl<T, P> Generator<T, P> {
         };
         let future = gen(Remit(mode));
         let future = inner.future.insert(future);
-        GeneratorIterator {
+        Generator {
             done: false,
             mode,
             future,
@@ -356,17 +360,17 @@ impl<T, P> Generator<T, P> {
     }
 
     #[allow(clippy::needless_lifetimes)]
-    /// The same as [`Generator::of()`] but allows passing a parameter in.
+    /// The same as [`Generators::of()`] but allows passing a parameter in.
     pub fn parameterized<'s, G, X>(
         self: Pin<&'s mut Self>,
         gen: G,
         parameter: X,
-    ) -> GeneratorIterator<'s, T, P>
+    ) -> Generator<'s, T, P, O>
         where
             // insures fn is not implemented only for 'static
-            G: RemitWithLifetime<T, (X,)>,
+            G: RemitWithLifetime<T, O, (X,)>,
             // insures P is properly defined, even if it actually has a lifetime
-            G: FnOnce(X, Remit<'static, T>) -> P,
+            G: FnOnce(X, Remit<'static, T, O>) -> P,
     {
         // SOUND: Pin passthrough; only `future` is inner-pinned.
         // `future` only ever gets replaced via Option::insert
@@ -379,7 +383,7 @@ impl<T, P> Generator<T, P> {
         };
         let future = gen(parameter, Remit(mode));
         let future = inner.future.insert(future);
-        GeneratorIterator {
+        Generator {
             done: false,
             mode,
             future,
@@ -395,7 +399,7 @@ impl<T, P> Generator<T, P> {
     /// The generator only needs to be valid for `'static`; it does not need to be valid for all lifetimes.
     ///
     /// To pass in parameters, use a capturing closure.
-    pub fn boxed(gen: impl FnOnce(Remit<'static, T>) -> P) -> GeneratorIterator<'static, T, P> {
+    pub fn boxed(gen: impl FnOnce(Remit<'static, T, O>) -> P) -> Generator<'static, T, P, O> {
         let rc = Rc::new(Cycler {
             future: Default::default(),
             references: References::new::<P>(),
@@ -410,7 +414,7 @@ impl<T, P> Generator<T, P> {
         let ptr = unsafe { &mut *rc.weak_inner.get() }.write(weak);
         // SOUND: no re-use of ptr
         // SOUND: !Send !Sync respected, via `*mut P` in GeneratorIterator.
-        rc.references.ptr.set(unsafe { Cycler::<P, T>::ptr_convert(ptr) });
+        rc.references.ptr.set(unsafe { Cycler::<P, T, O>::ptr_convert(ptr) });
 
         let mode = Mode::Boxed(&rc.references);
         // SOUND: Writing to an UnsafeCell.
@@ -419,7 +423,7 @@ impl<T, P> Generator<T, P> {
         // NEED: unsafe-cell lets shared-references to not conflict with exclusive-reference to future
         let future = unsafe { &mut *rc.future.get() }.insert(gen(Remit(mode)));
 
-        GeneratorIterator {
+        Generator {
             done: false,
             mode,
             future,
@@ -429,60 +433,82 @@ impl<T, P> Generator<T, P> {
 }
 
 #[cfg(feature = "alloc")]
-struct References<T> {
-    interchange: UnsafeCell<Values<T>>,
+struct References<T, O> {
+    interchange: UnsafeCell<Values<T, O>>,
     dropper: unsafe fn(*mut ()),
     checker: unsafe fn(*mut ()) -> bool,
     ptr: Cell<*mut ()>,
 }
 
 #[cfg(feature = "alloc")]
-impl<T> References<T> {
+impl<T, O> References<T, O> {
     fn new<P>() -> Self {
         References {
             interchange: UnsafeCell::new(Values::Missing),
-            dropper: Cycler::<P, T>::do_inner_drop,
-            checker: Cycler::<P, T>::is_strong,
+            dropper: Cycler::<P, T, O>::do_inner_drop,
+            checker: Cycler::<P, T, O>::is_strong,
             // Note that `null_mut` is only until the surrounding Rc gets created.
             ptr: Cell::new(null_mut()),
         }
     }
+
+    unsafe fn strong(this: *const Self) -> bool {
+        let inner_ptr = (*addr_of!((*this).ptr)).get();
+        // SOUND: checker is not pub, nor was inner_ptr,
+        // thus still valid from instantiation
+        //
+        // SOUND: unsafe-fn, see Cycler::is_strong
+        (*addr_of!((*this).checker))(inner_ptr)
+    }
+
+    unsafe fn dropping(this: *const Self) {
+        let inner_ptr = (*addr_of!((*this).ptr)).get();
+        // SOUND: dropper is not pub, nor was inner_ptr,
+        // thus still valid from instantiation
+        //
+        // SOUND: dropper only called once for inner_ptr,
+        // as inner_ptr only exists in this struct,
+        // and dropping is only called once.
+        //
+        // SOUND: unsafe-fn, see Cycler::do_inner_drop
+        (*addr_of!((*this).dropper))(inner_ptr)
+    }
 }
 
 #[cfg(feature = "alloc")]
-struct Cycler<P, T> {
+struct Cycler<P, T, O> {
     future: UnsafeCell<Option<P>>,
-    references: References<T>,
-    weak_inner: UnsafeCell<MaybeUninit<Weak<Cycler<P, T>>>>,
+    references: References<T, O>,
+    weak_inner: UnsafeCell<MaybeUninit<Weak<Cycler<P, T, O>>>>,
     _pin: PhantomPinned,
 }
 
 #[cfg(feature = "alloc")]
-impl<P, T> Cycler<P, T> {
+impl<P, T, O> Cycler<P, T, O> {
     #[inline(always)]
     /// Exclusive-ref must not reused.
     /// Resulting ptr must be kept !Send !Sync
     // NEED: erasing Cycler's storage generic, which ends up recursive
-    unsafe fn ptr_convert(ptr: &mut Weak<Cycler<P, T>>) -> *mut () {
-        ptr as _
+    unsafe fn ptr_convert(ptr: &mut Weak<Cycler<P, T, O>>) -> *mut () {
+        ptr as *mut _ as _
     }
 
     /// ptr must be created with this Cycler's ptr_convert.
     /// May only be called once.
     // NEED: erasing Cycler's storage generic, which ends up recursive
     unsafe fn do_inner_drop(ptr: *mut ()) {
-        let ptr: *mut Weak<Cycler<P, T>> = ptr as _;
+        let ptr: *mut Weak<Cycler<P, T, O>> = ptr as _;
         // SOUND: (Rc-race-condition) ptr_convert requires !Send !Sync
         // SOUND: (valid-ptr) ptr_convert instantiation
         // SOUND: (double-drop) can only be called once
-        let _: Weak<Cycler<P, T>> = read(ptr);
+        let _: Weak<Cycler<P, T, O>> = read(ptr);
     }
 
     /// ptr must be created with this Cycler's ptr_convert.
     /// Must not be called after do_inner_drop.
     // NEED: erasing Cycler's storage generic, which ends up recursive
     unsafe fn is_strong(ptr: *mut ()) -> bool {
-        let ptr: *const Weak<Cycler<P, T>> = ptr as _;
+        let ptr: *const Weak<Cycler<P, T, O>> = ptr as _;
         // SOUND: (use-after-free) can't be called after do_inner_drop
         // SOUND: (valid-ptr) ptr_convert instantiation
         // SOUND: (no exclusive ref violation) only exclusive-ref is do_inner_drop
@@ -497,19 +523,42 @@ impl<P, T> Cycler<P, T> {
 /// If one or more values are available, it will not poll until they have been consumed.
 ///
 /// The upper-bound of `size_hint` will be `None` iff the future has not completed.
-pub struct GeneratorIterator<'a, T, P> {
+pub struct Generator<'a, T, P, O = ()> {
     done: bool,
-    mode: Mode<'a, T>,
+    mode: Mode<'a, T, O>,
     future: *mut P,
     #[cfg(feature = "alloc")]
-    _owner: Option<Rc<Cycler<P, T>>>,
+    _owner: Option<Rc<Cycler<P, T, O>>>,
 }
 
-impl<T, P: Future<Output=()>> Iterator for GeneratorIterator<'_, T, P> {
-    type Item = T;
-    fn next(&mut self) -> Option<T> {
-        if let Some(value) = self.mode.next() {
-            return Some(value)
+impl<'a, T, P, O> Generator<'a, T, P, O> {
+    pub fn provider<F: FnMut() -> O>(self, provider: F) -> GeneratorIterator<'a, T, P, O, F> {
+        GeneratorIterator {
+            generator: self,
+            provider,
+        }
+    }
+}
+
+impl<'a, T, P, O: Default> Generator<'a, T, P, O> {
+    pub fn defaults(self) -> GeneratorIterator<'a, T, P, O, impl Fn() -> O> {
+        GeneratorIterator {
+            generator: self,
+            provider: Default::default,
+        }
+    }
+}
+
+pub struct GeneratorIterator<'a, T, P, O, F> {
+    generator: Generator<'a, T, P, O>,
+    provider: F,
+}
+
+impl<'s, T, P: Future<Output=()>, O: 's> Iterator for Generator<'s, T, P, O> {
+    type Item = Exchange<'s, T, O>;
+    fn next(&mut self) -> Option<Exchange<'s, T, O>> {
+        if let Some(entry) = self.mode.next() {
+            return Some(self.make_exchange(entry));
         }
         if self.done {
             return None
@@ -533,36 +582,300 @@ impl<T, P: Future<Output=()>> Iterator for GeneratorIterator<'_, T, P> {
         if let Poll::Ready(()) = unsafe { Pin::new_unchecked(&mut *self.future) }.poll(&mut Context::from_waker(&waker)) {
             self.done = true;
         }
-        self.mode.next()
+        Some(self.make_exchange(self.mode.next()?))
     }
+}
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.mode.len();
-        if self.done {
-            (len, Some(len))
-        } else {
-            (len, None)
+impl<'s, T, P: Future<Output=()>, O: 's> Generator<'s, T, P, O> {
+    fn make_exchange(&mut self, entry: (T, *mut Option<O>)) -> Exchange<'s, T, O> {
+        let (value, passback) = entry;
+        let (indirection, indirection_ctx) = match self.mode {
+            Mode::Pinned { value, .. } =>
+                (
+                    RemitBack::<O>::indirection_stack::<T> as Indirection<'s, O>,
+                    value as *const (),
+                ),
+            #[cfg(feature = "alloc")]
+            Mode::Boxed(references) => {
+                let _ = Rc::downgrade(unsafe { self._owner.as_ref().unwrap_unchecked() }).into_raw();
+                (
+                    RemitBack::<O>::indirection_boxed::<T> as Indirection<'s, O>,
+                    references as *const (),
+                )
+            },
+        };
+        Exchange {
+            value,
+            passback: RemitBack {
+                indirection,
+                indirection_ctx,
+                data: passback,
+                _ref: PhantomData,
+            },
         }
     }
 }
 
-enum Values<T> {
-    Present(T),
-    Missing,
-    #[cfg(feature = "alloc")]
-    Multiple(VecDeque<T>),
+impl<'s, T, P: Future<Output=()>, O: 's, F: FnMut() -> O> Iterator for GeneratorIterator<'s, T, P, O, F> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Some(
+            Exchange {
+                value,
+                passback,
+            }
+        ) = self.generator.next()
+            else { return None };
+        passback.provide((self.provider)());
+        Some(value)
+    }
 }
 
-enum Mode<'a, T> {
+#[must_use]
+pub struct Exchange<'a, T, O> {
+    value: T,
+    passback: RemitBack<'a, O>,
+}
+
+impl<T, O> AsRef<T> for Exchange<'_, T, O> {
+    fn as_ref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T, O> AsMut<T> for Exchange<'_, T, O> {
+    fn as_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
+
+impl<'a, T, O> Exchange<'a, T, O> {
+    pub fn handle(self, func: impl FnOnce(T) -> O) {
+        let (value, passback) = self.take();
+        passback.provide(func(value));
+    }
+
+    pub fn provide(self, value: O) -> T {
+        let Exchange {
+            value: ret,
+            passback,
+        } = self;
+        passback.provide(value);
+        ret
+    }
+
+    pub fn take(self) -> (T, RemitBack<'a, O>) {
+        let Exchange {
+            value,
+            passback,
+        } = self;
+        (value, passback)
+    }
+}
+
+type Indirection<'a, O> = unsafe fn(&RemitBack<'a, O>) -> bool;
+
+#[must_use]
+pub struct RemitBack<'a, O> {
+    indirection: Indirection<'a, O>,
+    indirection_ctx: *const (),
+    data: *mut Option<O>,
+    _ref: PhantomData<&'a ()>,
+}
+
+impl<O> RemitBack<'_, O> {
+    /// Must only be called once.
+    unsafe fn check(&self) -> bool {
+        // SOUND: only called once, see indirection
+        (self.indirection)(self)
+    }
+
+    /// May only be called after check returns true.
+    unsafe fn write(&self, value: O) {
+        // SOUND: check() insured that RemitFuture hadn't been dropped
+        write(self.data, Some(value))
+    }
+
+    fn remove<T>(&self, values: &mut Values<T, O>) -> bool {
+        values.remove(self.data)
+    }
+
+    unsafe fn indirection_stack<T>(&self) -> bool {
+        let values = &mut *(self.indirection_ctx as *mut Values<T, O>);
+        self.remove(values)
+    }
+
+    #[cfg(feature = "alloc")]
+    unsafe fn indirection_boxed<T>(&self) -> bool {
+        let references: *const References<T, O> = self.indirection_ctx as _;
+        if !References::strong(references) {
+            References::dropping(references);
+            return false;
+        }
+        References::dropping(references);
+        let values = &mut *(*references).interchange.get();
+        self.remove(values)
+    }
+}
+
+impl<O> Drop for RemitBack<'_, O> {
+    fn drop(&mut self) {
+        // SOUND: `drop` only called once,
+        // and other calls use ManuallyDrop.
+        let _ = unsafe { self.check() };
+    }
+}
+
+impl<O> RemitBack<'_, O> {
+    pub fn provide(self, value: O) {
+        let this = ManuallyDrop::new(self);
+        unsafe {
+            // SOUND: wont call check again due to skipping drop via ManuallyDrop
+            if this.check() {
+                // SOUND: check returned true
+                this.write(value);
+            }
+        }
+    }
+}
+
+impl<O: Default> RemitBack<'_, O> {
+    #[inline(always)]
+    pub fn provide_default(self) {
+        self.provide(O::default());
+    }
+}
+
+enum Values<T, O> {
+    Present(T, *mut Option<O>),
+    Waiting(*mut Option<O>),
+    Missing,
+    #[cfg(feature = "alloc")]
+    Multiple(VecDeque<(Option<T>, *mut Option<O>)>),
+}
+
+impl<T, O> Values<T, O> {
+    fn remove(&mut self, original_ptr: *mut Option<O>) -> bool {
+        use Values::*;
+        match self {
+            Present(_, _)
+            | Missing
+                => false,
+            Waiting(ptr) => {
+                let ptr = *ptr;
+                if eq(ptr, original_ptr) {
+                    *self = Missing;
+                    true
+                } else {
+                    false
+                }
+            },
+            #[cfg(feature = "alloc")]
+            Multiple(values) => {
+                for (ix, &(ref provided, passback)) in values.iter().enumerate() {
+                    if provided.is_some() {
+                        continue
+                    }
+                    if eq(passback, original_ptr) {
+                        // No-recursive drop because provided-is-none.
+                        // No-panic because enumerate-ix
+                        values.remove(ix);
+                        return true;
+                    }
+                }
+                false
+            },
+        }
+    }
+
+    fn next_inner(&mut self) -> Option<(T, *mut Option<O>)> {
+        use Values::*;
+        match self {
+            Missing
+            | Waiting(_)
+            => None,
+            &mut Present(_, passback) => {
+                let Present(value, passback) = mem::replace(self, Waiting(passback))
+                    else {
+                        // SOUND: note exclusive-reference and surrounding match
+                        unsafe { unreachable_unchecked() }
+                    };
+                Some((value, passback))
+            },
+            #[cfg(feature = "alloc")]
+            Multiple(list) => {
+                for (value, passback) in list.iter_mut() {
+                    if let Some(value) = value.take() {
+                        return Some((value, *passback));
+                    }
+                }
+                None
+            },
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    fn push_inner(&mut self, value: T, passback: *mut Option<O>) {
+        use Values::*;
+        let list = match self {
+            Missing => {
+                let Missing = mem::replace(self, Present(value, passback))
+                    else {
+                        // SOUND: note exclusive-reference and surrounding match
+                        unsafe { unreachable_unchecked() };
+                    };
+                return;
+            },
+            &mut Waiting(old_passback) => {
+                let Waiting(_) = mem::replace(self, Multiple(VecDeque::with_capacity(2)))
+                    else {
+                        // SOUND: note exclusive-reference and surrounding match
+                        unsafe { unreachable_unchecked() };
+                    };
+                let Multiple(list) = self
+                    else {
+                        // SOUND: note assignment above
+                        unsafe { unreachable_unchecked() };
+                    };
+                list.push_back((None, old_passback));
+                list
+            },
+            Present(_, _) => {
+                let Present(old_value, old_passback) = mem::replace(self, Multiple(VecDeque::with_capacity(2)))
+                    else {
+                        // SOUND: note exclusive-reference and surrounding match
+                        unsafe { unreachable_unchecked() };
+                    };
+                let Multiple(list) = self
+                    else {
+                        // SOUND: note assignment above
+                        unsafe { unreachable_unchecked() };
+                    };
+                list.push_back((Some(old_value), old_passback));
+                list
+            },
+            Multiple(list) => list,
+        };
+        list.push_back((Some(value), passback));
+    }
+
+    #[cfg(not(feature = "alloc"))]
+    fn push_inner(&mut self, value: T, ptr: *mut Option<O>) -> Values<T, O> {
+        mem::replace(self, Values::Present(value, ptr))
+    }
+}
+
+enum Mode<'a, T, O> {
     Pinned {
-        value: *mut Values<T>,
+        value: *mut Values<T, O>,
         _lifetime: PhantomData<&'a ()>,
     },
     #[cfg(feature = "alloc")]
-    Boxed(*const References<T>),
+    Boxed(*const References<T, O>),
 }
 
-impl<T> Clone for Mode<'_, T> {
+impl<T, O> Clone for Mode<'_, T, O> {
     fn clone(&self) -> Self {
         *self
     }
@@ -572,11 +885,11 @@ impl<T> Clone for Mode<'_, T> {
     }
 }
 
-impl<T> Copy for Mode<'_, T> {}
+impl<T, O> Copy for Mode<'_, T, O> {}
 
-impl<T> Mode<'_, T> {
+impl<T, O> Mode<'_, T, O> {
     #[inline(always)]
-    fn values(&self) -> *mut Values<T> {
+    fn values(&self) -> *mut Values<T, O> {
         match *self {
             Mode::Pinned {
                 value,
@@ -597,7 +910,7 @@ impl<T> Mode<'_, T> {
     }
 
     #[inline(always)]
-    fn next(&self) -> Option<T> {
+    fn next(&self) -> Option<(T, *mut Option<O>)> {
         // SOUND: (valid-ptr) Not-pub, and is always valid at instantiation.
         //
         // SOUND: (use-after-free) Not public type.
@@ -611,27 +924,11 @@ impl<T> Mode<'_, T> {
         //
         // NEED: lock-free exchange
         // NEED: pinned-variant's lifetime cheat
-        Self::next_inner(unsafe { &mut *self.values() })
-    }
-
-    fn next_inner(values: &mut Values<T>) -> Option<T> {
-        use Values::*;
-        match values {
-            Missing => None,
-            Present(_) =>
-                if let Present(value) = mem::replace(values, Missing) {
-                    Some(value)
-                } else {
-                    // SOUND: note exclusive-reference and surrounding match
-                    unsafe { unreachable_unchecked() }
-                },
-            #[cfg(feature = "alloc")]
-            Multiple(list) => list.pop_front(),
-        }
+        unsafe { &mut *self.values() }.next_inner()
     }
 
     #[inline(always)]
-    fn push(&self, value: T) {
+    fn push(&self, value: T, passback: *mut Option<O>) {
         // SOUND: (valid-ptr) Not-pub, and is always valid at instantiation.
         //
         // SOUND: (use-after-free) Not public type.
@@ -645,94 +942,91 @@ impl<T> Mode<'_, T> {
         //
         // NEED: lock-free exchange
         // NEED: pinned-variant's lifetime cheat
-        let _ = Self::push_inner(unsafe { &mut *self.values() }, value);
+        let _ = unsafe { &mut *self.values() }.push_inner(value, passback);
     }
 
     #[cfg(feature = "alloc")]
-    fn push_inner(values: &mut Values<T>, value: T) {
-        use Values::*;
-        match values {
-            Missing => *values = Present(value),
-            Present(_) => {
-                let Present(old) = mem::replace(values, Missing)
-                    else {
-                        // SOUND: note exclusive-reference and surrounding match
-                        unsafe { unreachable_unchecked() }
-                    };
-                let mut list = VecDeque::with_capacity(2);
-                list.push_back(old);
-                list.push_back(value);
-                *values = Multiple(list);
-            },
-            Multiple(list) => list.push_back(value),
+    /// Requires the box-ptr to be instantiated correctly.
+    /// May not be called after dropping.
+    // SOUND: (use-after-free) cannot be called after dropping()
+    //
+    // SOUND: (no exclusive ref violation)
+    // * `*const ptr`s never borrowed exclusively
+    // * ptrs never leaked
+    //
+    // NEED: erasing Cycler's storage generic, which ends up recursive
+    // NEED: use-after-free prevention of value-exchange
+    unsafe fn strong(&self) -> bool {
+        if let &Mode::Boxed(ptr) = self {
+            References::strong(ptr)
+        } else {
+            true
         }
     }
+}
 
-    #[cfg(not(feature = "alloc"))]
-    fn push_inner(values: &mut Values<T>, value: T) -> Values<T> {
-        mem::replace(values, Values::Present(value))
-    }
+enum ExchangeState<T, O> {
+    Waiting(T),
+    // cannot make a finished state, because pinning
+    Provided(UnsafeCell<Option<O>>, PhantomPinned),
+}
 
-    #[inline(always)]
-    fn len(&self) -> usize {
-        // SOUND: (null-ptr) Not-pub, and is always valid at instantiation.
-        //
-        // SOUND: (use-after-free) Not public type.
-        // Either encapsulating type owns it, or reflected in lifetime.
-        //
-        // SOUND: (no exclusive ref violation)
-        // * only accessed in this impl
-        // * non-recursively (note: no calls to drop)
-        // * !Send, !Sync
-        //
-        // NEED: lock-free exchange
-        // NEED: pinned-variant's lifetime cheat
-        Self::len_inner(unsafe { &*self.values() })
-    }
+struct RemitFuture<'a, T, O> {
+    exchange: ExchangeState<T, O>,
+    mode: Mode<'a, T, O>,
+    _pin: PhantomPinned,
+}
 
-    fn len_inner(values: &Values<T>) -> usize {
-        use Values::*;
-        match values {
-            Present(_) => 1,
-            Missing => 0,
-            #[cfg(feature = "alloc")]
-            Multiple(list) => list.len(),
+impl<T, O> Future for RemitFuture<'_, T, O> {
+    type Output = O;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        if let ExchangeState::Provided(provided, _) = &this.exchange {
+            if let Some(value) = unsafe { &mut *provided.get() }.take() {
+                return Poll::Ready(value);
+            }
+            return Poll::Pending;
         }
-    }
-
-    #[inline(always)]
-    fn is_empty(&self) -> bool {
-        // SOUND: (valid-ptr) Not-pub, and is always valid at instantiation.
-        //
-        // SOUND: (use-after-free) Not public type.
-        // Either encapsulating type owns it, or reflected in lifetime.
-        //
-        // SOUND: (no exclusive ref violation)
-        // * only accessed in this impl
-        // * non-recursively (note: no calls to drop)
-        // * !Send, !Sync
-        //
-        // NEED: lock-free exchange
-        // NEED: pinned-variant's lifetime cheat
-        Self::is_empty_inner(unsafe { &*self.values() })
-    }
-
-    fn is_empty_inner(values: &Values<T>) -> bool {
-        use Values::*;
-        match values {
-            Present(_) => false,
-            Missing => true,
-            #[cfg(feature = "alloc")]
-            Multiple(list) => list.is_empty(),
+        let ExchangeState::Waiting(value) = mem::replace(
+            &mut this.exchange,
+            ExchangeState::Provided(UnsafeCell::new(None), PhantomPinned)
+        )
+            else {
+                unsafe { unreachable_unchecked() };
+            };
+        let ExchangeState::Provided(cell, _) = &this.exchange
+            else {
+                unsafe { unreachable_unchecked() }
+            };
+        let ptr = cell.get();
+        if unsafe { this.mode.strong() } {
+            this.mode.push(value, ptr);
         }
+
+        Poll::Pending
+    }
+}
+
+impl<T, O> Drop for RemitFuture<'_, T, O> {
+    fn drop(&mut self) {
+        let ExchangeState::Provided(cell, _) = &self.exchange
+            else {
+                return
+            };
+        let ptr = cell.get();
+        if unsafe { &*ptr }.is_some() {
+            return
+        }
+        unsafe { &mut *self.mode.values() }.remove(ptr);
     }
 }
 
 /// Allows a generator to provide values to an iterator.
 /// A generator that only accepts the `'static` lifetime can only be used when boxed.
-pub struct Remit<'a, T>(Mode<'a, T>);
+pub struct Remit<'a, T, O = ()>(Mode<'a, T, O>);
 
-impl<T> Remit<'_, T> {
+impl<T, O> Remit<'_, T, O> {
     /// Remits the value to the iterator.
     ///
     /// If multiple calls are performed without awaiting for the iterator to consume them,
@@ -750,65 +1044,15 @@ impl<T> Remit<'_, T> {
     /// If the iterator has been dropped,
     /// values will be discarded and the future(s) will always poll as pending.
     #[inline(always)]
-    pub fn value(&self, value: T) -> impl Future<Output=()> + '_ {
-        self.value_impl(value)
+    pub fn value<'a>(&'a self, value: T) -> impl Future<Output=O> + 'a {
+        Self::value_impl(self.0, value)
     }
 
-    #[cfg(not(feature = "alloc"))]
-    fn value_impl(&self, value: T) -> impl Future<Output=()> + '_ {
-        self.0.push(value);
-        poll_fn(|_ctx|
-            if self.0.is_empty() {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        )
-    }
-
-    #[cfg(feature = "alloc")]
-    fn value_impl(&self, value: T) -> impl Future<Output=()> + '_ {
-        // SOUND: non-public field, valid at instantiation
-        // SOUND: self not dropped
-        //
-        // NEED: use-after-free prevention of value-exchange
-        if unsafe { self.strong() } {
-            self.0.push(value);
-        }
-        poll_fn(|_ctx|
-            // SOUND: non-public field, valid at instantiation
-            // SOUND: self not dropped
-            //
-            // NEED: use-after-free prevention of value-exchange
-            if unsafe { self.strong() } && self.0.is_empty() {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        )
-    }
-
-    #[cfg(feature = "alloc")]
-    /// Requires the box-ptr to be instantiated correctly.
-    /// May not be called after dropping.
-    // SOUND: (use-after-free) cannot be called after dropping()
-    //
-    // SOUND: (no exclusive ref violation)
-    // * `*const ptr`s never borrowed exclusively
-    // * ptrs never leaked
-    //
-    // NEED: erasing Cycler's storage generic, which ends up recursive
-    // NEED: use-after-free prevention of value-exchange
-    unsafe fn strong(&self) -> bool {
-        if let &Remit(Mode::Boxed(ptr)) = self {
-            let inner_ptr = (*addr_of!((*ptr).ptr)).get();
-            // SOUND: checker is not pub, nor was inner_ptr,
-            // thus still valid from instantiation
-            //
-            // SOUND: unsafe-fn, see Cycler::is_strong
-            (*addr_of!((*ptr).checker))(inner_ptr)
-        } else {
-            true
+    fn value_impl(mode: Mode<'_, T, O>, value: T) -> RemitFuture<'_, T, O> {
+        RemitFuture {
+            exchange: ExchangeState::Waiting(value),
+            mode,
+            _pin: Default::default(),
         }
     }
 
@@ -825,22 +1069,13 @@ impl<T> Remit<'_, T> {
     // NEED: erasing Cycler's storage generic, which ends up recursive
     unsafe fn dropping(&mut self) {
         if let &mut Remit(Mode::Boxed(ptr)) = self {
-            let inner_ptr = (*addr_of!((*ptr).ptr)).get();
-            // SOUND: dropper is not pub, nor was inner_ptr,
-            // thus still valid from instantiation
-            //
-            // SOUND: dropper only called once for inner_ptr,
-            // as inner_ptr only exists in this struct,
-            // and dropping is only called once.
-            //
-            // SOUND: unsafe-fn, see Cycler::do_inner_drop
-            (*addr_of!((*ptr).dropper))(inner_ptr)
+            References::dropping(ptr)
         }
     }
 }
 
 #[cfg(feature = "alloc")]
-impl<T> Drop for Remit<'_, T> {
+impl<T, O> Drop for Remit<'_, T, O> {
     fn drop(&mut self) {
         // SOUND: Valid at instantiation
         // SOUND: Only call-site of dropping, and inner ptrs
