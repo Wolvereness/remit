@@ -99,6 +99,33 @@
 //! # }
 //! ```
 //!
+//! Usage of generators that exchange values.
+//! ```
+//! # use remit::{Generators, Remit};
+//! # use std::pin::pin;
+//! async fn health_regen((starting, regen, minimum): (usize, usize, usize), remit: Remit<'_, usize, usize>) {
+//!     let mut current = starting;
+//!     while current >= minimum {
+//!         let damage = remit.value(current).await;
+//!         current -= damage;
+//!         current += regen;
+//!     }
+//! }
+//!
+//! let mut buffer = vec![];
+//! for exchange in pin!(Generators::new()).parameterized_exchange(health_regen, (400, 3, 20)) {
+//!     let (previous, to_damage) = exchange.take();
+//!     buffer.push(previous);
+//!     to_damage.provide(previous * 2 / 7);
+//! }
+//! assert_eq!(
+//!     buffer,
+//!     vec![400, 289, 210, 153, 113, 84, 63, 48, 38, 31, 26, 22],
+//! );
+//!
+//!
+//! ```
+//!
 //! Unorthodox usage of yielding values.
 //! ```
 //! # use std::future::{Future, poll_fn};
@@ -110,7 +137,7 @@
 //! async fn no_await(remit: Remit<'_, usize>) {
 //!     let mut a = pin!(remit.value(2));
 //!     let mut a_done = false;
-//!     let _ = remit.value(3);
+//!     let _ = remit.value(3); // Never gets yielded
 //!     let mut b = pin!(remit.value(5));
 //!     let mut b_done = false;
 //!     let _ = remit.value(7).await;
@@ -134,6 +161,7 @@
 //!                 c_done = true;
 //!             }
 //!         }
+//!         // Without alloc, a & b & c were pushed out after being polled.
 //!         d.as_mut().poll(ctx)
 //!     }).await;
 //!     remit.value(17).await;
