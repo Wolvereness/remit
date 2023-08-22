@@ -122,7 +122,7 @@ impl<T, O> Values<T, O> {
     }
 
     #[cfg(not(feature = "alloc"))]
-    fn push_inner(&mut self, value: T, ptr: *mut Option<O>) -> Values<T, O> {
+    pub(crate) fn push_inner(&mut self, value: T, ptr: *mut Option<O>) -> Values<T, O> {
         mem::replace(self, Values::Present(value, ptr))
     }
 }
