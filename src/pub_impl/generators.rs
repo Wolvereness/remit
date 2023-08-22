@@ -89,7 +89,8 @@ impl<T, P, O> Generators<T, P, O> {
     /// Takes the pinned storage and the generator and provides a `Generator`.
     /// Stack based (does not use an allocation).
     ///
-    /// The `Generator` will provide [`Exchange`]s to facilitate sending back values.
+    /// The `Generator` will provide [`Exchange`](super::super::Exchange)s to facilitate
+    /// sending back values.
     /// [`Generators::of()`] should be used when sending back values isn't meaningful.
     ///
     /// The internal storage assumes the generator was valid for a provided `'static`,
@@ -134,7 +135,8 @@ impl<T, P, O> Generators<T, P, O> {
     /// Uses an allocation so that the `Generator` does not need to be borrowed.
     /// Useful for returning an iterator from a function, where it can't be pinned to the stack.
     ///
-    /// The `Generator` will provide [`Exchange`]s to facilitate sending back values.
+    /// The `Generator` will provide [`Exchange`](super::super::Exchange)s to facilitate
+    /// sending back values.
     /// [`Generators::boxed()`] should be used when sending back values isn't meaningful.
     ///
     /// The generator only needs to be valid for `'static`; it does not need to be valid for all lifetimes.
