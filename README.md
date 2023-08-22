@@ -8,12 +8,15 @@
 Rust generators implemented through async/await syntax.
 
 The pinned implementation is stack-based, and the boxed is heap-based.
-No fancy macros and a simple API. Values can be lazily or eagerly yielded.
+No fancy macros and a simple API.
+Values are remitted/yielded analogous to how they're awaited.
+Response values can also be sent back to the awaiting location.
 
 This crate is inherently no-std, and the default `alloc` feature can be disabled.
+This crate also uses no dependencies outside of `core` and `alloc`.
 
 Some behaviors exhibited by the *lack* of `alloc` are not part of the SemVer.
-For example, not awaiting before another remit, without alloc, is
+For example, not awaiting each value one at a time, without alloc, is
 [unspecified](https://doc.rust-lang.org/reference/behavior-not-considered-unsafe.html)
 behavior.
 
@@ -30,6 +33,7 @@ Example code:
 ```rust
 use std::pin::pin;
 use remit::{Generator, Remit};
+fn main() {
 
 async fn gen(remit: Remit<'_, usize>) {
     remit.value(42).await;
@@ -52,7 +56,7 @@ assert_eq!(
 );
 */
 assert_eq!(vec![42, 1], Generator::boxed(gen).take(2).collect::<Vec<_>>());
-assert_eq!(vec![1], Generator::boxed(|remit| async move { remit.value(1).await; }).collect::<Vec<_>>());
+assert_eq!(vec![1], Generator::boxed(|remit| async move { let () = remit.value(1).await; }).collect::<Vec<_>>());
 
 fn iter() -> impl Iterator<Item=usize> {
     Generator::boxed(gen)
@@ -62,7 +66,7 @@ async fn scream<D: std::fmt::Display>(iter: impl Iterator<Item=D>, remit: Remit<
     for person in iter {
         remit.value(format!("{person} scream!")).await
     }
-    remit.value("... for ice cream!".to_string());
+    remit.value("... for ice cream!".to_string()).await;
 }
 let expected: Vec<String> = ["You scream!", "I scream!", "We all scream!", "... for ice cream!"].iter().map(ToString::to_string).collect();
 assert_eq!(
@@ -73,6 +77,31 @@ assert_eq!(
     expected,
     Generator::boxed(|remit| scream(["You", "I", "We all"].iter(), remit)).collect::<Vec<String>>(),
 );
+
+// Sending/exchanging values back into the generator-function:
+async fn health_regen(
+    (starting, regen, minimum): (usize, usize, usize),
+    remit: Remit<'_, usize, usize>,
+) {
+    let mut current = starting;
+    while current >= minimum {
+        let damage = remit.value(current).await;
+        current -= damage;
+        current += regen;
+    }
+}
+let mut buffer = vec![];
+for exchange in pin!(Generators::new()).parameterized_exchange(health_regen, (400, 3, 20)) {
+    let (previous, to_damage) = exchange.take();
+    buffer.push(previous);
+    to_damage.provide(previous * 2 / 7);
+}
+assert_eq!(
+    buffer,
+    vec![400, 289, 210, 153, 113, 84, 63, 48, 38, 31, 26, 22],
+);
+
+}
 ```
 
 ## License
