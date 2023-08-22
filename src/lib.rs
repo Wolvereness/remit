@@ -394,12 +394,26 @@ use internal_impl::{
 pub unsafe trait RemitWithLifetime<T, O, X> {}
 
 /// The storage used for iterators that poll a generator.
+///
+/// Stack-based generation requires pinning a [`Generators`],
+/// while heap-based generation will internally handle the storage.
 pub struct Generators<T, P, O = ()> {
     values: UnsafeCell<Values<T, O>>,
     future: Option<P>,
     _pin: PhantomPinned,
 }
 
+/// The container for a particular generator, iterable over [`Exchange`]s.
+///
+/// APIs that provide a [`GeneratorIterator`] are suggested when no meaningful data is sent back in [`Exchange`].
+/// These include [`Generator::defaults()`], [`Generator::provider()`],
+/// or most preferably the associated constructions from [`Generators`].
+///
+/// If the provided function `await`s without having remitting a value, the iterator will return `None`.
+/// The iterator can continue to provide more values even after having returned `None` if more values are remitted during another poll.
+/// If one or more values are available, it will not poll until they have been consumed.
+///
+/// The upper-bound of `size_hint` will be `None` iff the future has not completed.
 pub struct Generator<'a, T, P, O = ()> {
     done: bool,
     mode: Mode<'a, T, O>,
@@ -408,7 +422,7 @@ pub struct Generator<'a, T, P, O = ()> {
     owner: Option<Rc<Cycler<P, T, O>>>,
 }
 
-/// An iterator over generated values.
+/// An iterator over only the generated values.
 ///
 /// If the provided function `await`s without having remitting a value, the iterator will return `None`.
 /// The iterator can continue to provide more values even after having returned `None` if more values are remitted during another poll.
@@ -421,6 +435,9 @@ pub struct GeneratorIterator<'a, T, P, F, O = ()> {
 }
 
 #[must_use]
+/// Holds the incoming value and handles sending values back into the generator.
+///
+/// Values should always be provided, or the awaiting sites will never complete.
 pub struct Exchange<'a, T, O> {
     value: T,
     passback: RemitBack<'a, O>,
@@ -429,6 +446,9 @@ pub struct Exchange<'a, T, O> {
 type Indirection<'a, O> = unsafe fn(&RemitBack<'a, O>) -> bool;
 
 #[must_use]
+/// Handles sending values back into the generator.
+///
+/// Values should always be provided, or the awaiting sites will never complete.
 pub struct RemitBack<'a, O> {
     indirection: Indirection<'a, O>,
     indirection_ctx: *const (),
@@ -437,5 +457,6 @@ pub struct RemitBack<'a, O> {
 }
 
 /// Allows a generator to provide values to an iterator.
+///
 /// A generator that only accepts the `'static` lifetime can only be used when boxed.
 pub struct Remit<'a, T, O = ()>(Mode<'a, T, O>);

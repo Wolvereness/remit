@@ -24,46 +24,6 @@ impl<T, P, O> Generators<T, P, O> {
     }
 }
 
-impl<T, P, O> Generators<T, P, O> {
-    #[allow(clippy::needless_lifetimes)]
-    #[inline(always)]
-    pub fn pinned_exchange<'s, G>(
-        self: Pin<&'s mut Self>,
-        gen: G,
-    ) -> Generator<'s, T, P, O>
-        where
-            // insures fn is not implemented only for 'static
-            G: RemitWithLifetime<T, O, ()>,
-            // insures P is properly defined, even if it actually has a lifetime
-            G: FnOnce(Remit<'static, T, O>) -> P,
-            O: 's,
-    {
-        self.impl_pinned_exchange(gen)
-    }
-
-    #[inline(always)]
-    pub fn parameterized_exchange<'s, G, X>(
-        self: Pin<&'s mut Self>,
-        gen: G,
-        parameter: X,
-    ) -> Generator<'s, T, P, O>
-        where
-            // insures fn is not implemented only for 'static
-            G: RemitWithLifetime<T, O, (X,)>,
-            // insures P is properly defined, even if it actually has a lifetime
-            G: FnOnce(X, Remit<'static, T, O>) -> P,
-            O: 's,
-    {
-        self.impl_parameterized_exchange(gen, parameter)
-    }
-
-    #[cfg(feature = "alloc")]
-    #[inline(always)]
-    pub fn boxed_exchange(gen: impl FnOnce(Remit<'static, T, O>) -> P) -> Generator<'static, T, P, O> {
-        Self::impl_boxed_exchange(gen)
-    }
-}
-
 impl<T, P, O: Default> Generators<T, P, O> {
     #[allow(clippy::needless_lifetimes)]
     #[inline(always)]
@@ -77,7 +37,7 @@ impl<T, P, O: Default> Generators<T, P, O> {
     /// In effect, this relaxes the lifetime requirements of the storage,
     /// but not the provided generator.
     ///
-    /// Uses the default value for exchange, which is implicitly unit.
+    /// Uses the [`Default::default()`] value for exchange, which is implicitly [unit].
     pub fn of<'s, G>(
         self: Pin<&'s mut Self>,
         gen: G,
@@ -120,5 +80,67 @@ impl<T, P, O: Default> Generators<T, P, O> {
     /// Uses the [`Default::default()`] value for exchange, which is implicitly [unit].
     pub fn boxed(gen: impl FnOnce(Remit<'static, T, O>) -> P) -> GeneratorIterator<'static, T, P, impl Fn() -> O, O> {
         Self::impl_boxed_exchange(gen).defaults()
+    }
+}
+
+impl<T, P, O> Generators<T, P, O> {
+    #[allow(clippy::needless_lifetimes)]
+    #[inline(always)]
+    /// Takes the pinned storage and the generator and provides a `Generator`.
+    /// Stack based (does not use an allocation).
+    ///
+    /// The `Generator` will provide [`Exchange`]s to facilitate sending back values.
+    /// [`Generators::of()`] should be used when sending back values isn't meaningful.
+    ///
+    /// The internal storage assumes the generator was valid for a provided `'static`,
+    /// but requires the generator to be valid for all provided lifetimes.
+    /// That is, the `Remit` provided to the generator cannot be moved out,
+    /// even if at first glance it appears the storage does not have that restriction.
+    /// In effect, this relaxes the lifetime requirements of the storage,
+    /// but not the provided generator.
+    pub fn pinned_exchange<'s, G>(
+        self: Pin<&'s mut Self>,
+        gen: G,
+    ) -> Generator<'s, T, P, O>
+        where
+        // insures fn is not implemented only for 'static
+            G: RemitWithLifetime<T, O, ()>,
+        // insures P is properly defined, even if it actually has a lifetime
+            G: FnOnce(Remit<'static, T, O>) -> P,
+            O: 's,
+    {
+        self.impl_pinned_exchange(gen)
+    }
+
+    #[inline(always)]
+    /// The same as [`Generators::pinned_exchange()`] but allows passing a parameter in.
+    pub fn parameterized_exchange<'s, G, X>(
+        self: Pin<&'s mut Self>,
+        gen: G,
+        parameter: X,
+    ) -> Generator<'s, T, P, O>
+        where
+        // insures fn is not implemented only for 'static
+            G: RemitWithLifetime<T, O, (X,)>,
+        // insures P is properly defined, even if it actually has a lifetime
+            G: FnOnce(X, Remit<'static, T, O>) -> P,
+            O: 's,
+    {
+        self.impl_parameterized_exchange(gen, parameter)
+    }
+
+    #[cfg(feature = "alloc")]
+    #[inline(always)]
+    /// Uses an allocation so that the `Generator` does not need to be borrowed.
+    /// Useful for returning an iterator from a function, where it can't be pinned to the stack.
+    ///
+    /// The `Generator` will provide [`Exchange`]s to facilitate sending back values.
+    /// [`Generators::boxed()`] should be used when sending back values isn't meaningful.
+    ///
+    /// The generator only needs to be valid for `'static`; it does not need to be valid for all lifetimes.
+    ///
+    /// To pass in parameters, use a capturing closure.
+    pub fn boxed_exchange(gen: impl FnOnce(Remit<'static, T, O>) -> P) -> Generator<'static, T, P, O> {
+        Self::impl_boxed_exchange(gen)
     }
 }

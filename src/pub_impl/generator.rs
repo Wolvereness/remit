@@ -7,6 +7,9 @@ use super::super::{
 };
 
 impl<'a, T, P, O> Generator<'a, T, P, O> {
+    /// Transforms into a [`GeneratorIterator`].
+    ///
+    /// Will use the provided generator to send values back through the [`Exchange`]s.
     pub fn provider<F: FnMut() -> O>(self, provider: F) -> GeneratorIterator<'a, T, P, F, O> {
         GeneratorIterator {
             generator: self,
@@ -16,6 +19,9 @@ impl<'a, T, P, O> Generator<'a, T, P, O> {
 }
 
 impl<'a, T, P, O: Default> Generator<'a, T, P, O> {
+    /// Transforms into a [`GeneratorIterator`].
+    ///
+    /// Will use [`Default`] values to send through the [`Exchange`]s.
     pub fn defaults(self) -> GeneratorIterator<'a, T, P, impl Fn() -> O, O> {
         GeneratorIterator {
             generator: self,

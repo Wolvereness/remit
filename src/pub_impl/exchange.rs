@@ -16,11 +16,15 @@ impl<T, O> AsMut<T> for Exchange<'_, T, O> {
 }
 
 impl<'a, T, O> Exchange<'a, T, O> {
+    /// The function will be used to create a value to send back.
     pub fn handle(self, func: impl FnOnce(T) -> O) {
         let (value, passback) = self.take();
         passback.provide(func(value));
     }
 
+    /// Sends a value back.
+    ///
+    /// The underlying received value is returned.
     pub fn provide(self, value: O) -> T {
         let Exchange {
             value: ret,
@@ -30,6 +34,9 @@ impl<'a, T, O> Exchange<'a, T, O> {
         ret
     }
 
+    /// Take ownership of the underlying value.
+    ///
+    /// The [`RemitBack`] can send a value back.
     pub fn take(self) -> (T, RemitBack<'a, O>) {
         let Exchange {
             value,
