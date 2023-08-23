@@ -27,8 +27,8 @@ impl<T, O> Remit<'_, T, O> {
     /// # Consistency Warning
     ///
     /// If the future is polled, but dropped after the value is received, and a new future is
-    /// polled before the [`RemitBack`](super::super::RemitBack) or
-    /// [`Exchange`](super::super::Exchange) are handled, the provided value may be mis-matched.
+    /// polled before the [`RemitBack`](crate::RemitBack) or
+    /// [`Exchange`](crate::Exchange) are handled, the provided value may be mis-matched.
     ///
     /// ```
     /// use std::pin::pin;
