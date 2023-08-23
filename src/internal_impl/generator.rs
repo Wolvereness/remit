@@ -1,39 +1,31 @@
 use core::{
     future::Future,
     marker::PhantomData,
+    pin::Pin,
+    task::{
+        Context,
+        Poll,
+        Waker,
+    },
 };
 
 use super::super::{
-        Exchange,
-        Generator,
-        Indirection,
-        RemitBack,
-        internal_impl::mode::Mode,
+    Exchange,
+    Generator,
+    RemitBack,
+    internal_impl::mode::Mode,
+    context,
 };
-
-#[cfg(feature = "alloc")]
-use alloc::rc::Rc;
-use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
-use crate::context;
 
 impl<'s, T, P: Future<Output=()>, O: 's> Generator<'s, T, P, O> {
     pub(crate) fn make_exchange(&mut self, entry: (T, *mut Option<O>)) -> Exchange<'s, T, O> {
         let (value, passback) = entry;
         let (indirection, indirection_ctx) = match self.mode {
             Mode::Pinned { value, .. } =>
-                (
-                    RemitBack::<O>::indirection_stack::<T> as Indirection<'s, O>,
-                    value as *const (),
-                ),
+                RemitBack::<O>::indirection_stack_ptr::<'s, T>(value),
             #[cfg(feature = "alloc")]
-            Mode::Boxed(references) => {
-                let _ = Rc::downgrade(unsafe { self.owner.as_ref().unwrap_unchecked() }).into_raw();
-                (
-                    RemitBack::<O>::indirection_boxed::<T> as Indirection<'s, O>,
-                    references as *const (),
-                )
-            },
+            Mode::Boxed(references) =>
+                RemitBack::<O>::indirection_boxed_ptr::<T, P>(references, &self.owner),
         };
         Exchange {
             value,
@@ -66,7 +58,7 @@ impl<'s, T, P: Future<Output=()>, O: 's> Generator<'s, T, P, O> {
         // Original exclusive-reference was also used for creation without leaking.
         //
         // SOUND: (use-after-free) The ptr's lifetime is reflected in GeneratorIterator,
-        // either owned in _owner, or pinned-self.
+        // either owned in owner, or pinned-self.
         //
         // SOUND: (valid-ptr) Not-pub, and is always valid at instantiation.
         if let Poll::Ready(()) = unsafe { Pin::new_unchecked(&mut *self.future) }.poll(&mut Context::from_waker(&waker)) {

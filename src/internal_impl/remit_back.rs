@@ -3,13 +3,20 @@ use core::{
     ptr::write,
 };
 
+#[cfg(feature = "alloc")]
+use alloc::rc::Rc;
+
 use super::super::{
     Values,
     RemitBack,
+    Indirection,
 };
 
 #[cfg(feature = "alloc")]
-use super::super::References;
+use super::{
+    cycler::Cycler,
+    super::References,
+};
 
 impl<O> RemitBack<'_, O> {
     pub(crate) fn impl_provide(self, value: O) {
@@ -39,20 +46,39 @@ impl<O> RemitBack<'_, O> {
         values.remove(self.data)
     }
 
-    pub(crate) unsafe fn indirection_stack<T>(&self) -> bool {
+    pub(crate) fn indirection_stack_ptr<'s, T>(ptr: *mut Values<T, O>) -> (Indirection<'s, O>, *const ()) {
+        (
+            RemitBack::<'s, O>::indirection_stack::<T>,
+            ptr as _,
+        )
+    }
+
+    unsafe fn indirection_stack<T>(&self) -> bool {
         let values = &mut *(self.indirection_ctx as *mut Values<T, O>);
         self.remove(values)
     }
 
     #[cfg(feature = "alloc")]
-    pub(crate) unsafe fn indirection_boxed<T>(&self) -> bool {
+    pub(crate) fn indirection_boxed_ptr<'s, 'a, T, P>(
+        ptr: *const References<T, O>,
+        rc: &'a Option<Rc<Cycler<P, T, O>>>,
+    ) -> (Indirection<'s, O>, *const ()) {
+        let _ = Rc::downgrade(unsafe { rc.as_ref().unwrap_unchecked() }).into_raw();
+        (
+            RemitBack::<'s, O>::indirection_boxed::<T>,
+            ptr as _,
+        )
+    }
+
+    #[cfg(feature = "alloc")]
+    unsafe fn indirection_boxed<T>(&self) -> bool {
         let references: *const References<T, O> = self.indirection_ctx as _;
-        if !References::strong(references) {
-            References::dropping(references);
+        let strong = References::strong(references);
+        References::dropping(references);
+        if !strong {
             return false;
         }
         // SOUND: strong reference exists
-        References::dropping(references);
         self.remove((&*references).values())
     }
 }
