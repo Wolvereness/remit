@@ -315,9 +315,7 @@ use core::{
 extern crate alloc;
 
 #[cfg(feature = "alloc")]
-use alloc::rc::{
-    Rc,
-};
+use alloc::rc::Rc;
 
 mod context;
 mod internal_impl {
