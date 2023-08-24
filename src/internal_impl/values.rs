@@ -55,7 +55,7 @@ impl<T, O> Values<T, O> {
         match self {
             Missing
             | Waiting(_)
-            => None,
+                => None,
             &mut Present(_, passback) => {
                 let Present(value, passback) = mem::replace(self, Waiting(passback))
                     else {

@@ -25,7 +25,8 @@ impl<'s, T, P: Future<Output=()>, O: 's> Generator<'s, T, P, O> {
                 RemitBack::<O>::indirection_stack_ptr::<'s, T>(value),
             #[cfg(feature = "alloc")]
             Mode::Boxed(references) =>
-                RemitBack::<O>::indirection_boxed_ptr::<T, P>(references, &self.owner),
+                // SOUND: Boxed mode is allocated, which means owner is-some
+                unsafe { RemitBack::<O>::indirection_boxed_ptr::<T, P>(references, &self.owner) },
         };
         Exchange {
             value,

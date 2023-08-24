@@ -32,7 +32,7 @@ impl<T, O> References<T, O> {
         }
     }
 
-    /// Must not be have multiple aliases.
+    /// Must not have multiple aliases.
     pub unsafe fn values(&self) -> &mut Values<T, O> {
         unsafe { &mut *self.interchange.get() }
     }
@@ -46,6 +46,7 @@ impl<T, O> References<T, O> {
         (*addr_of!((*this).checker))(inner_ptr)
     }
 
+    /// Drops a weak; may only be called once per weak.
     pub unsafe fn dropping(this: *const Self) {
         let inner_ptr = (*addr_of!((*this).ptr)).get();
         // SOUND: dropper is not pub, nor was inner_ptr,

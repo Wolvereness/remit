@@ -32,6 +32,7 @@ impl<T, O> Remit<'_, T, O> {
 impl<T, O> Drop for Remit<'_, T, O> {
     fn drop(&mut self) {
         if let &mut Remit(Mode::Boxed(ptr)) = self {
+            // SOUND: Remit was constructed with a single Weak
             unsafe { References::dropping(ptr) }
         }
     }

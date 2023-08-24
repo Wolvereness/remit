@@ -32,7 +32,7 @@ impl<O> RemitBack<'_, O> {
 
     /// Must only be called once.
     unsafe fn check(&self) -> bool {
-        // SOUND: only called once, see indirection
+        // SOUND: only called once, see indirection_{stack|boxed}
         (self.indirection)(self)
     }
 
@@ -53,16 +53,21 @@ impl<O> RemitBack<'_, O> {
         )
     }
 
+    /// May only be called as-constructed by indirection_stack_ptr,
+    /// and only once.
+    // NEED: erasing <T>
     unsafe fn indirection_stack<T>(&self) -> bool {
         let values = &mut *(self.indirection_ctx as *mut Values<T, O>);
         self.remove(values)
     }
 
     #[cfg(feature = "alloc")]
-    pub(crate) fn indirection_boxed_ptr<'s, 'a, T, P>(
+    /// May only be called from the boxed variant.
+    pub(crate) unsafe fn indirection_boxed_ptr<'s, 'a, T, P>(
         ptr: *const References<T, O>,
         rc: &'a Option<Rc<Cycler<P, T, O>>>,
     ) -> (Indirection<'s, O>, *const ()) {
+        // SOUND: boxed variant always has the RC
         let _ = Rc::downgrade(unsafe { rc.as_ref().unwrap_unchecked() }).into_raw();
         (
             RemitBack::<'s, O>::indirection_boxed::<T>,
@@ -71,9 +76,14 @@ impl<O> RemitBack<'_, O> {
     }
 
     #[cfg(feature = "alloc")]
+    /// May only be called as-constructed by indirection_boxed_ptr,
+    /// and only once.
+    // NEED: erasing <T>
     unsafe fn indirection_boxed<T>(&self) -> bool {
         let references: *const References<T, O> = self.indirection_ctx as _;
         let strong = References::strong(references);
+        // SOUND: indirection_boxed_ptr increased the weak count
+        // SOUND: only called once
         References::dropping(references);
         if !strong {
             return false;
