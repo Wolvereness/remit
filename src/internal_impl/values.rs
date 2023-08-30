@@ -22,6 +22,7 @@ impl<T, O> Values<T, O> {
             Missing
                 => false,
             // RemitBack can't have Present, but RemitFuture can.
+            // FIXME: value dropped with &mut Values for RemitFuture (soundness bug)
             Present(_, ptr)
             | Waiting(ptr) => {
                 let ptr = *ptr;
@@ -35,6 +36,7 @@ impl<T, O> Values<T, O> {
             #[cfg(feature = "alloc")]
             Multiple(values) => {
                 for (ix, &(ref provided, passback)) in values.iter().enumerate() {
+                    // FIXME: needs to remove for RemitFuture anyway (soundness bug)
                     if provided.is_some() {
                         continue
                     }
