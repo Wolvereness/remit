@@ -1,10 +1,16 @@
 use core::{
     future::Future,
-    marker::PhantomData,
+    marker::{
+        PhantomData,
+        Unpin,
+    },
     pin::Pin,
     task::{
         Context,
-        Poll,
+        Poll::{
+            self,
+            *,
+        },
         Waker,
     },
 };
@@ -16,6 +22,8 @@ use super::super::{
     internal_impl::mode::Mode,
     context,
 };
+
+impl<T, P, O> Unpin for Generator<'_, T, P, O> {}
 
 impl<'s, T, P: Future<Output=()>, O: 's> Generator<'s, T, P, O> {
     pub(crate) fn make_exchange(&mut self, entry: (T, *mut Option<O>)) -> Exchange<'s, T, O> {
@@ -39,17 +47,24 @@ impl<'s, T, P: Future<Output=()>, O: 's> Generator<'s, T, P, O> {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn impl_next(&mut self) -> Option<Exchange<'s, T, O>> {
-        if let Some(entry) = self.mode.next() {
-            return Some(self.make_exchange(entry));
-        }
-        if self.done {
-            return None
-        }
         // FIXME: https://github.com/rust-lang/rust/issues/102012
         // SOUND: We can't use Arc without alloc,
         // so context just defines some no-operation functions to fill out a v-table.
         let waker = unsafe { Waker::from_raw(context::NOOP_WAKER) };
+        let Ready(value) = self.impl_poll_next(&mut Context::from_waker(&waker))
+            else { return None };
+        value
+    }
+
+    pub(crate) fn impl_poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Exchange<'s, T, O>>> {
+        if let Some(entry) = self.mode.next() {
+            return Ready(Some(self.make_exchange(entry)));
+        }
+        if self.done {
+            return Ready(None)
+        }
         // SOUND: (pinning) Sound, we created the ptr to future ourselves and it was pinned,
         // either via Rc or via a pinned-self.
         //
@@ -62,9 +77,15 @@ impl<'s, T, P: Future<Output=()>, O: 's> Generator<'s, T, P, O> {
         // either owned in owner, or pinned-self.
         //
         // SOUND: (valid-ptr) Not-pub, and is always valid at instantiation.
-        if let Poll::Ready(()) = unsafe { Pin::new_unchecked(&mut *self.future) }.poll(&mut Context::from_waker(&waker)) {
+        if let Ready(()) = unsafe { Pin::new_unchecked(&mut *self.future) }.poll(cx) {
             self.done = true;
         }
-        Some(self.make_exchange(self.mode.next()?))
+        if let Some(value) = self.mode.next() {
+            Ready(Some(self.make_exchange(value)))
+        } else if self.done {
+            Ready(None)
+        } else {
+            Pending
+        }
     }
 }

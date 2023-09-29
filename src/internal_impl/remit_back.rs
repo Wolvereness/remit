@@ -42,7 +42,7 @@ impl<O> RemitBack<'_, O> {
         write(self.data, Some(value))
     }
 
-    fn remove<T>(&self, values: &mut Values<T, O>) -> bool {
+    fn remove<T>(&self, values: &mut Values<T, O>) -> (Option<T>, bool) {
         values.remove(self.data)
     }
 
@@ -57,8 +57,10 @@ impl<O> RemitBack<'_, O> {
     /// and only once.
     // NEED: erasing <T>
     unsafe fn indirection_stack<T>(&self) -> bool {
-        let values = &mut *(self.indirection_ctx as *mut Values<T, O>);
-        self.remove(values)
+        {
+            let values = &mut *(self.indirection_ctx as *mut Values<T, O>);
+            self.remove(values)
+        }.1 // SOUND: Drops the T after `&mut Values` has left scope
     }
 
     #[cfg(feature = "alloc")]
@@ -89,7 +91,7 @@ impl<O> RemitBack<'_, O> {
             return false;
         }
         // SOUND: strong reference exists
-        self.remove((&*references).values())
+        self.remove((&*references).values()).1
     }
 }
 

@@ -283,6 +283,45 @@
 //! */
 //! ```
 //!
+//! Usage of generators as if they were streams.
+//! ```
+//! # use std::borrow::Cow;
+//! # use std::pin::{pin, Pin};
+//! # use remit::*;
+//! # use std::future::{Future, poll_fn};
+//! # use std::task::Poll;
+//!
+//! async fn gen_implicit(data: Cow<'_, str>, remit: Remit<'_, usize>) {
+//!     // This can await on any normal future,
+//!     // because callers use a context via .next_item_future() or .poll_next_item()
+//!     remit.value(data.len()).await;
+//!     remit.value(data.len()).await;
+//! }
+//!
+//! async fn async_function_stack() {
+//!     let data = String::from("This future is automatic");
+//!     let stack = pin!(Generators::new());
+//!     let mut stream = stack.parameterized(gen_implicit, Cow::Borrowed(&data));
+//!     while let Some(item) = stream.next_item_future().await {
+//!         dbg!(item);
+//!     }
+//! }
+//!
+//! # #[cfg(feature = "alloc")]
+//! fn async_function_unpin() -> impl Future<Output=()> + Unpin {
+//!     let data = String::from("This future is unpin");
+//!     let mut boxed = Generators::boxed(move |remit| gen_implicit(Cow::Owned(data), remit));
+//!     poll_fn(move |cx| {
+//!         while let Poll::Ready(next) = Pin::new(&mut boxed).poll_next_item(cx) {
+//!             let Some(item) = next
+//!                 else { return Poll::Ready(()); };
+//!             dbg!(item);
+//!         }
+//!         Poll::Pending
+//!     })
+//! }
+//! ```
+//!
 //! Incorrect attempt of a stack-based generator.
 //! ```compile_fail
 //! # use std::pin::pin;
@@ -295,6 +334,23 @@
 //! for item in pin!(Generators::new()).of(gen) {
 //!     println!("{item}");
 //! }
+//! ```
+//! ```compile_fail
+//! # use std::pin::pin;
+//! # use remit::{Generators, Remit};
+//! use std::cell::Cell;
+//! use std::rc::Rc;
+//! async fn gen<'a>(cell: Rc<Cell<Option<Remit<'a, usize>>>>, remit: Remit<'a, usize>) {
+//!     cell.set(Some(remit)); // UB for stack-generators!
+//! }
+//! // Fails to compile, because gen sets a bad lifetime.
+//! let cell = Rc::new(Cell::new(None));
+//! for item in pin!(Generators::new()).parameterized(gen, Rc::clone(&cell)) {
+//!     println!("{item}");
+//! }
+//! let Some(remit) = cell.take()
+//!     else { panic!() };
+//! // Now we have remit! That should be illegal.
 //! ```
 //!
 //! ## Features
@@ -370,7 +426,9 @@ mod pub_impl {
     mod fn_traits;
     mod remit_back;
     mod generator_iter;
+    mod generator_iter_next;
     mod generator;
+    mod generator_next;
 }
 
 use internal_impl::{
@@ -458,3 +516,22 @@ pub struct RemitBack<'a, O> {
 ///
 /// A generator that only accepts the `'static` lifetime can only be used when boxed.
 pub struct Remit<'a, T, O = ()>(Mode<'a, T, O>);
+
+/// Allows a generator to work even with nested-async context.
+///
+/// Obtained from [`Generator::next_item_future()`].
+///
+/// Note that the [`Future`](std::future::Future) from [`Remit`](Remit::value())
+/// does not wake and must be polled unilaterally,
+/// especially given an actual context.
+pub struct GeneratorNext<'a, 's, T, P, O>(&'a mut Generator<'s, T, P, O>);
+
+/// Allows a generator-iter to work even with nested-async context.
+///
+/// Obtained from [`GeneratorIterator::next_item_future()`].
+///
+/// Note that the [`Future`](std::future::Future) from [`Remit`](Remit::value())
+/// does not wake and must be polled unilaterally,
+/// especially given an actual context.
+pub struct GeneratorIterNext<'a, 's, T, P, F, O>(&'a mut GeneratorIterator<'s, T, P, F, O>);
+

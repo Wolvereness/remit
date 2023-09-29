@@ -16,38 +16,43 @@ pub enum Values<T, O> {
 }
 
 impl<T, O> Values<T, O> {
-    pub(crate) fn remove(&mut self, original_ptr: *mut Option<O>) -> bool {
+    // SOUND: This function does not drop any T, preventing recursive exclusive references.
+    pub(crate) fn remove(&mut self, original_ptr: *mut Option<O>) -> (Option<T>, bool) {
         use Values::*;
         match self {
             Missing
-                => false,
-            // RemitBack can't have Present, but RemitFuture can.
-            // FIXME: value dropped with &mut Values for RemitFuture (soundness bug)
-            Present(_, ptr)
-            | Waiting(ptr) => {
+                => (None, false),
+            Present(_, ptr) => {
                 let ptr = *ptr;
                 if eq(ptr, original_ptr) {
+                    let Present(value, _) = mem::replace(self,Missing)
+                        else {
+                            // SOUND: note exclusive-reference and surrounding match
+                            unsafe { unreachable_unchecked() }
+                        };
+                    (Some(value), true)
+                } else {
+                    (None, false)
+                }
+            },
+            Waiting(ptr) => {
+                let ptr = *ptr;
+                (None, if eq(ptr, original_ptr) {
                     *self = Missing;
                     true
                 } else {
                     false
-                }
+                })
             },
             #[cfg(feature = "alloc")]
             Multiple(values) => {
-                for (ix, &(ref provided, passback)) in values.iter().enumerate() {
-                    // FIXME: needs to remove for RemitFuture anyway (soundness bug)
-                    if provided.is_some() {
-                        continue
-                    }
+                for (ix, &(_, passback)) in values.iter().enumerate() {
                     if eq(passback, original_ptr) {
-                        // No-recursive drop because provided-is-none.
                         // No-panic because enumerate-ix
-                        values.remove(ix);
-                        return true;
+                        return (values.remove(ix).and_then(|(value, _)| value), true);
                     }
                 }
-                false
+                (None, false)
             },
         }
     }
